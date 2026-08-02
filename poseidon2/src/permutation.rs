@@ -85,14 +85,100 @@ fn linear_layer(m: &[[u32; WIDTH]; WIDTH]) -> Script {
     }
 }
 
-/// The external linear layer, `mds_light_permutation`.
-pub fn mds_light() -> Script {
+/// The external linear layer as a dense matrix. Correct, and the oracle the
+/// structured [`mds_light`] is checked against, but sixteen terms per output.
+pub fn mds_light_dense() -> Script {
     linear_layer(&reference::mds_light_matrix())
 }
 
-/// The internal linear layer.
-pub fn internal_linear() -> Script {
+/// The internal linear layer as a dense matrix. See [`mds_light_dense`].
+pub fn internal_linear_dense() -> Script {
     linear_layer(&reference::internal_matrix())
+}
+
+/// The external linear layer, `mds_light_permutation`.
+///
+/// Emitted structurally rather than as a matrix. `M4` is block-diagonal, so
+/// each element of the first pass depends on only the four members of its own
+/// chunk, and the outer circulant then adds one column sum. Sixteen terms per
+/// output collapse to four, twice.
+pub fn mds_light() -> Script {
+    // Pass one: M4 within each chunk of four. From `apply_mat4`,
+    //   x0' = 2x0 + 3x1 +  x2 +  x3        x1' =  x0 + 2x1 + 3x2 +  x3
+    //   x2' =  x0 +  x1 + 2x2 + 3x3        x3' = 3x0 +  x1 +  x2 + 2x3
+    const M4: [[u32; 4]; 4] = [[2, 3, 1, 1], [1, 2, 3, 1], [1, 1, 2, 3], [3, 1, 1, 2]];
+    let mut pass1 = [[0u32; WIDTH]; WIDTH];
+    for i in 0..WIDTH {
+        let (chunk, row) = (i / 4, i % 4);
+        for col in 0..4 {
+            pass1[i][chunk * 4 + col] = M4[row][col];
+        }
+    }
+    // Pass two: y_i = x_i' + sum over the four x' sharing i mod 4, which is the
+    // same as giving x_i' a coefficient of two.
+    let mut pass2 = [[0u32; WIDTH]; WIDTH];
+    for i in 0..WIDTH {
+        for j in (i % 4..WIDTH).step_by(4) {
+            pass2[i][j] = 1;
+        }
+        pass2[i][i] += 1;
+    }
+    script! {
+        { linear_layer(&pass1) }
+        { linear_layer(&pass2) }
+    }
+}
+
+/// The internal linear layer.
+///
+/// `new[i] = full_sum + V[i] * old[i]`, so the whole layer is one sum plus
+/// sixteen scalings — two terms per output instead of sixteen. The sum is
+/// computed once and copied.
+pub fn internal_linear() -> Script {
+    // V, as the reference applies it. Entries that are divisions become one
+    // `mul_by_constant`; the small integer entries become doublings.
+    let v = internal_diagonal();
+    let mut rows: Vec<Script> = Vec::with_capacity(WIDTH);
+    for (i, &c) in v.iter().enumerate() {
+        // Above the state sit the running sum and the `i` finished outputs.
+        let above = 1 + i;
+        rows.push(script! {
+            { copy_input(i, above) }
+            { scale(c) }
+            // Above the sum now sit the `i` finished outputs and this term,
+            // so the sum is `i + 1` deep.
+            { i + 1 } OP_PICK
+            { field::add() }
+        });
+    }
+    script! {
+        // full_sum = s[0] + .. + s[15], left above the untouched state.
+        { copy_input(0, 0) }
+        for j in 1..WIDTH {
+            { copy_input(j, 1) }
+            { field::add() }
+        }
+        for r in rows { { r } }
+        // Stack: state, sum, outputs. Park the outputs, drop the rest, restore.
+        for _ in 0..WIDTH { OP_TOALTSTACK }
+        OP_DROP
+        for _ in 0..WIDTH / 2 { OP_2DROP }
+        for _ in 0..WIDTH { OP_FROMALTSTACK }
+    }
+}
+
+/// `V` from Plonky3's `internal_layer_mat_mul`, as field elements.
+///
+/// Recovered from [`reference::internal_matrix`] rather than transcribed: the
+/// diagonal entry is the coefficient of input `i` in output `i`, less the one
+/// that the all-ones part of the matrix contributes.
+fn internal_diagonal() -> [u32; WIDTH] {
+    let m = reference::internal_matrix();
+    core::array::from_fn(|i| {
+        // Row i is `full_sum + V[i] * s[i]`, so the off-diagonal entries are all
+        // 1 and the diagonal is `1 + V[i]`.
+        reference::sub(m[i][i], m[i][(i + 1) % WIDTH])
+    })
 }
 
 /// Add a round constant to the top element and cube it.
@@ -125,11 +211,37 @@ fn internal_sbox_layer(c: u32) -> Script {
     }
 }
 
+/// The permutation as a sequence of independently checkable steps.
+///
+/// One permutation is 572 KB, well past `MAX_STANDARD_TX_WEIGHT`, so a disprove
+/// script cannot execute a whole one. It can execute a single round: the prover
+/// commits to the state between rounds, and a challenge names the round it
+/// claims is wrong. Each script here takes a state and leaves a state, so a
+/// disprove runs exactly one of them against a hinted input and a hinted output.
+///
+/// Chaining every script in order is `permute()` exactly; `rounds_compose_to_the_permutation`
+/// asserts it.
+pub fn rounds() -> Vec<Script> {
+    let mut out = Vec::with_capacity(1 + EXTERNAL_INITIAL.len() + INTERNAL.len() + EXTERNAL_FINAL.len());
+    // The opening linear layer, before any constant is added.
+    out.push(mds_light());
+    for rc in EXTERNAL_INITIAL.iter() {
+        out.push(script! { { external_sbox_layer(rc) } { mds_light() } });
+    }
+    for c in INTERNAL.iter() {
+        out.push(script! { { internal_sbox_layer(*c) } { internal_linear() } });
+    }
+    for rc in EXTERNAL_FINAL.iter() {
+        out.push(script! { { external_sbox_layer(rc) } { mds_light() } });
+    }
+    out
+}
+
 /// The Poseidon2 permutation.
 ///
 /// Input: sixteen canonical KoalaBear elements, `s[0]` deepest.
 /// Output: the permuted state, same layout.
-pub fn poseidon2_permute() -> Script {
+pub fn permute() -> Script {
     script! {
         { mds_light() }
         for rc in EXTERNAL_INITIAL.iter() {
@@ -155,9 +267,9 @@ pub fn poseidon2_permute() -> Script {
 ///
 /// This is `TruncatedPermutation<_, 2, 8, 16>` in Plonky3's terms, the
 /// compression function a `MerkleTreeMmcs` is built from.
-pub fn poseidon2_compress() -> Script {
+pub fn compress() -> Script {
     script! {
-        { poseidon2_permute() }
+        { permute() }
         // Keep s[0..8], drop s[8..16].
         for _ in 0..WIDTH / 2 / 2 { OP_2DROP }
     }

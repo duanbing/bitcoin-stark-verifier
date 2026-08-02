@@ -1,13 +1,13 @@
 //! The reference implementation must agree with Plonky3.
 //!
-//! `permutation.rs` checks the script against [`bitcoin_poseidon2_script::reference`].
+//! `permutation.rs` checks the script against [`poseidon2::reference`].
 //! This closes the chain: the reference against Plonky3's own
 //! `default_koalabear_poseidon2_16`. If Plonky3 changes its constants or its
 //! linear layers, this fails rather than the crate quietly computing a
 //! different hash.
 
-use bitcoin_poseidon2_script::constants::WIDTH;
-use bitcoin_poseidon2_script::reference;
+use poseidon2::constants::WIDTH;
+use poseidon2::reference;
 use p3_field::PrimeCharacteristicRing;
 use p3_field::PrimeField32;
 use p3_koala_bear::{KoalaBear, default_koalabear_poseidon2_16};
@@ -22,7 +22,7 @@ fn reference_matches_plonky3() {
 
     for _ in 0..8 {
         let raw: [u32; WIDTH] =
-            core::array::from_fn(|_| rng.random_range(0..bitcoin_poseidon2_script::constants::P));
+            core::array::from_fn(|_| rng.random_range(0..poseidon2::constants::P));
 
         let mut theirs: [KoalaBear; WIDTH] = core::array::from_fn(|i| KoalaBear::new(raw[i]));
         perm.permute_mut(&mut theirs);

@@ -1,0 +1,28 @@
+[package]
+name = "whir"
+description = "The WHIR sumcheck round in Bitcoin Script"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bitcoin.workspace = true
+bitcoin-script.workspace = true
+poseidon2 = { path = "../poseidon2" }
+
+[dev-dependencies]
+bitcoin-scriptexec.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true
+p3-whir.workspace = true
+p3-sumcheck.workspace = true
+p3-challenger.workspace = true
+p3-commit.workspace = true
+p3-merkle-tree.workspace = true
+p3-dft.workspace = true
+p3-multilinear-util.workspace = true
+p3-field.workspace = true
+p3-koala-bear.workspace = true
+p3-symmetric.workspace = true
+p3-matrix.workspace = true
+rand010.workspace = true

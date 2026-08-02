@@ -24,14 +24,16 @@
 //!
 //! Sizing, primarily. The open question for a post-quantum BitVM verifier is
 //! what a Poseidon2 permutation costs in script, because that number decides
-//! whether a FRI verifier is affordable. [`poseidon2_permute`] emits the script;
+//! whether a FRI verifier is affordable. [`permute`] emits the script;
 //! its length is the answer.
 //!
 //! [`rust-bitcoin-m31`]: https://github.com/Bitcoin-Wildlife-Sanctuary/rust-bitcoin-m31
 
 pub mod constants;
+pub mod ext4;
 pub mod field;
-pub mod poseidon2;
+pub mod merkle;
+pub mod permutation;
 pub mod reference;
 
 pub(crate) mod treepp {
@@ -41,4 +43,5 @@ pub(crate) mod treepp {
 }
 
 pub use constants::{EXTERNAL_FINAL, EXTERNAL_INITIAL, INTERNAL, P, WIDTH};
-pub use poseidon2::{poseidon2_compress, poseidon2_permute};
+pub use merkle::{merkle_path, merkle_verify};
+pub use permutation::{compress, permute};

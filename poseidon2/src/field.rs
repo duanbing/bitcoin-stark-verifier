@@ -126,20 +126,31 @@ pub fn mul_by_constant(c: u32) -> Script {
         return script! {};
     }
     let digits = naf(c);
-    // The stack holds `a acc`. The leading NAF digit is 1, so the accumulator
-    // starts as a copy of the input; the input itself is kept underneath to be
-    // folded back in wherever a digit is non-zero, and dropped at the end.
+    // Working stack `P a acc`, for the same reason as `mul`: the modulus is a
+    // five-byte push and this loop names it about eighty times. The leading NAF
+    // digit is 1, so the accumulator starts as a copy of the input; the input
+    // stays underneath to be folded back in wherever a digit is non-zero.
     script! {
+        { P } OP_SWAP
         OP_DUP
         for i in (0..digits.len() - 1).rev() {
-            { double() }
+            { double_at(2) }
             if digits[i] == 1 {
-                OP_OVER { add() }
+                OP_OVER { add_at(3) }
             } else if digits[i] == -1 {
-                OP_OVER { sub() }
+                OP_OVER { sub_at(3) }
             }
         }
-        OP_SWAP OP_DROP
+        OP_TOALTSTACK OP_2DROP OP_FROMALTSTACK
+    }
+}
+
+/// Subtract, with the modulus `p_depth` down. See [`add_at`].
+fn sub_at(p_depth: usize) -> Script {
+    script! {
+        OP_SUB
+        OP_DUP 0 OP_LESSTHAN
+        OP_IF { p_depth - 1 } OP_PICK OP_ADD OP_ENDIF
     }
 }
 
@@ -180,27 +191,121 @@ fn bits_to_altstack() -> Script {
     }
 }
 
+/// Add, with the modulus already on the stack `p_depth` items down.
+///
+/// `P` is `0x7f000001`, which is a five-byte push every time it is named, and
+/// [`add`] names it twice. Inside [`mul`] there are sixty-two additions, so
+/// keeping one copy on the stack and reaching it with `OP_PICK` — two bytes,
+/// since these depths are under sixteen — is the single largest saving
+/// available. `rust-bitcoin-m31` credits the same optimisation.
+///
+/// Consumes two elements and leaves one, so on exit the modulus is one item
+/// shallower than it was; callers track that.
+fn add_at(p_depth: usize) -> Script {
+    script! {
+        { p_depth } OP_PICK OP_SUB          // twist the top operand
+        OP_ADD
+        OP_DUP 0 OP_LESSTHAN
+        OP_IF { p_depth - 1 } OP_PICK OP_ADD OP_ENDIF
+    }
+}
+
+/// Double, with the modulus `p_depth` down. Leaves the stack depth unchanged.
+fn double_at(p_depth: usize) -> Script {
+    script! {
+        OP_DUP
+        { add_at(p_depth + 1) }
+    }
+}
+
 /// Multiply two canonical elements.
 ///
 /// Input: `a b` — Output: `a * b`
 ///
-/// Double-and-add from the least significant bit: the stack carries
-/// `running_double accumulator`, and each bit either folds the running double
-/// into the accumulator or does not.
+/// Double-and-add from the least significant bit. The working stack is
+/// `P cur acc`: `cur` is the running multiple of `a`, doubled every round, and
+/// each bit of `b` decides whether it folds into `acc`. The modulus sits
+/// underneath both so [`add_at`] can reach it, which is what makes the round
+/// body cheap.
 pub fn mul() -> Script {
     script! {
         { bits_to_altstack() }      // stack: a        altstack: bits, lsb on top
-        0                           // stack: a acc
+        { P } OP_SWAP               // stack: P cur
+        0                           // stack: P cur acc
         for i in 0..BITS {
             OP_FROMALTSTACK
             OP_IF
-                OP_OVER { add() }
+                OP_OVER             // copy cur; P is now three down
+                { add_at(3) }
             OP_ENDIF
             if i < BITS - 1 {
-                OP_SWAP { double() } OP_SWAP
+                OP_SWAP             // bring cur up, P stays two down
+                { double_at(2) }
+                OP_SWAP
             }
         }
+        // stack: P cur acc
+        OP_TOALTSTACK OP_2DROP OP_FROMALTSTACK
+    }
+}
+
+/// Verify a hinted inverse.
+///
+/// Input: `x x_inv` — Output: `x_inv`, and the script aborts unless
+/// `x * x_inv == 1`.
+///
+/// Inversion is the one field operation a FRI or DEEP check needs that is not
+/// a multiply-add, and computing it in script would mean exponentiating by
+/// `P - 2` — about sixty multiplications, near ninety thousand bytes. Letting
+/// the prover supply the inverse and checking it costs one multiplication.
+/// This is the standard BitVM pattern and needs no opcode script lacks.
+pub fn inverse_hinted() -> Script {
+    script! {
+        OP_2DUP { mul() }
+        1 OP_EQUALVERIFY
         OP_SWAP OP_DROP
+    }
+}
+
+/// Decompose the top element into its low `n` bits, pushed to the altstack
+/// most-significant first, so popping yields least-significant first.
+///
+/// A verifier needs this to turn a squeezed challenge into a query index, which
+/// looks like it wants `OP_MOD`. Comparison and subtraction do it instead.
+pub fn low_bits_to_altstack(n: usize) -> Script {
+    script! {
+        // Start at the top bit, not at bit n-1: the bits above n have to be
+        // subtracted away or every comparison below them succeeds. Discarding
+        // them as they are peeled off is the reduction.
+        for i in (0..BITS).rev() {
+            OP_DUP { 1u32 << i } OP_GREATERTHANOREQUAL
+            OP_IF { 1u32 << i } OP_SUB 1 OP_ELSE 0 OP_ENDIF
+            if i < n { OP_TOALTSTACK } else { OP_DROP }
+        }
+        OP_DROP
+    }
+}
+
+/// `g^i` for a fixed base `g` and an `n`-bit exponent taken from the stack.
+///
+/// Evaluating the trace at a query point needs a power of the domain generator,
+/// and the exponent is only known at spend time. Squaring the base is a
+/// compile-time operation, so each bit costs one multiply-by-constant.
+pub fn pow_const_base(g: u32, n: usize) -> Script {
+    // g^(2^j), all known when the script is built.
+    let mut sq = Vec::with_capacity(n);
+    let mut cur = g % P;
+    for _ in 0..n {
+        sq.push(cur);
+        cur = ((cur as u64 * cur as u64) % P as u64) as u32;
+    }
+    script! {
+        { low_bits_to_altstack(n) }
+        1
+        for j in 0..n {
+            OP_FROMALTSTACK
+            OP_IF { mul_by_constant(sq[j]) } OP_ENDIF
+        }
     }
 }
 

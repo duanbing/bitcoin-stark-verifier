@@ -1,12 +1,12 @@
 //! Correctness and sizing.
 //!
 //! The script is executed under `bitcoin-scriptexec` and its final stack
-//! compared against [`bitcoin_poseidon2_script::reference`], which is itself
+//! compared against [`poseidon2::reference`], which is itself
 //! checked against Plonky3 in `plonky3_agreement`. So the chain is
 //! script → reference → Plonky3, and a break anywhere fails a test.
 
-use bitcoin_poseidon2_script::constants::{P, WIDTH};
-use bitcoin_poseidon2_script::{field, poseidon2, reference};
+use poseidon2::constants::{P, WIDTH};
+use poseidon2::{field, permutation, reference};
 use bitcoin_script::{define_pushable, script};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
@@ -126,12 +126,12 @@ fn linear_layers_match_reference() {
 
         let mut want = st;
         reference::mds_light(&mut want);
-        let got = run(script! { for x in st { {x} } {poseidon2::mds_light()} });
+        let got = run(script! { for x in st { {x} } {permutation::mds_light()} });
         assert_eq!(got, want.to_vec(), "mds_light");
 
         let mut want = st;
         reference::internal_linear(&mut want);
-        let got = run(script! { for x in st { {x} } {poseidon2::internal_linear()} });
+        let got = run(script! { for x in st { {x} } {permutation::internal_linear()} });
         assert_eq!(got, want.to_vec(), "internal_linear");
     }
 }
@@ -143,7 +143,7 @@ fn permutation_matches_reference() {
         let st: [u32; WIDTH] = core::array::from_fn(|_| rand_fe(&mut rng));
         let mut want = st;
         reference::permute(&mut want);
-        let got = run(script! { for x in st { {x} } {poseidon2::poseidon2_permute()} });
+        let got = run(script! { for x in st { {x} } {permutation::permute()} });
         assert_eq!(got, want.to_vec());
     }
 }
@@ -152,7 +152,7 @@ fn permutation_matches_reference() {
 /// `OP_CAT`. If this fails the design claim is void.
 #[test]
 fn uses_no_disabled_opcode() {
-    let s = poseidon2::poseidon2_permute();
+    let s = permutation::permute();
     // OP_CAT, OP_SUBSTR, OP_LEFT, OP_RIGHT, OP_INVERT, OP_AND, OP_OR, OP_XOR,
     // OP_2MUL, OP_2DIV, OP_MUL, OP_DIV, OP_MOD, OP_LSHIFT, OP_RSHIFT.
     const DISABLED: [u8; 15] = [
@@ -171,13 +171,13 @@ fn uses_no_disabled_opcode() {
 /// The number the whole exercise is for.
 #[test]
 fn report_size() {
-    let perm = poseidon2::poseidon2_permute();
-    let compress = poseidon2::poseidon2_compress();
+    let perm = permutation::permute();
+    let compress = permutation::compress();
     let mul = field::mul();
     let mul_c = field::mul_by_constant(0x12345678);
     let cube = field::cube();
-    let mds = poseidon2::mds_light();
-    let internal = poseidon2::internal_linear();
+    let mds = permutation::mds_light();
+    let internal = permutation::internal_linear();
 
     // Witness data is one weight unit per byte in a taproot spend; the script
     // sits in the witness, so bytes and weight units coincide here.
@@ -198,4 +198,112 @@ fn report_size() {
         "  MAX_BLOCK_WEIGHT is 4000000; one permutation is {:.4}x that\n",
         perm.len() as f64 / 4_000_000.0
     );
+}
+
+/// The structured layers must equal the dense matrix versions they replace.
+/// This is what makes the optimisation safe to trust.
+#[test]
+fn structured_layers_equal_dense() {
+    let mut rng = ChaCha20Rng::seed_from_u64(11);
+    for _ in 0..4 {
+        let st: [u32; WIDTH] = core::array::from_fn(|_| rand_fe(&mut rng));
+        let dense = run(script! { for x in st { {x} } {permutation::mds_light_dense()} });
+        let structured = run(script! { for x in st { {x} } {permutation::mds_light()} });
+        assert_eq!(structured, dense, "mds_light");
+
+        let dense = run(script! { for x in st { {x} } {permutation::internal_linear_dense()} });
+        let structured = run(script! { for x in st { {x} } {permutation::internal_linear()} });
+        assert_eq!(structured, dense, "internal_linear");
+    }
+}
+
+/// The operations a verifier needs beyond the hash, and which look at first
+/// glance as though they want a disabled opcode. None of them do.
+#[test]
+fn verifier_primitives_need_no_disabled_opcode() {
+    let mut rng = ChaCha20Rng::seed_from_u64(41);
+
+    // Inversion, hinted and checked.
+    for _ in 0..6 {
+        let x = rng.random_range(1..P);
+        let inv = mod_pow(x, P - 2);
+        assert_eq!(reference::mul(x, inv), 1, "test's own inverse is wrong");
+        assert_eq!(run(script! { {x} {inv} {field::inverse_hinted()} }), vec![inv]);
+    }
+
+    // A challenge reduced to a query index, without OP_MOD.
+    for _ in 0..6 {
+        let c = rng.random_range(0..P);
+        let bits = 12usize;
+        let want = c & ((1 << bits) - 1);
+        // Reassemble the bits the script pushed, most significant last.
+        // Bits pop least-significant first, so weight them as they come.
+        let got = run(script! {
+            {c}
+            { field::low_bits_to_altstack(bits) }
+            0
+            for j in 0..bits {
+                OP_FROMALTSTACK
+                OP_IF { 1u32 << j } OP_ADD OP_ENDIF
+            }
+        });
+        assert_eq!(got.len(), 1, "index {c}");
+        assert_eq!(got[0], want, "low {bits} bits of {c}");
+    }
+
+    // A power of the domain generator at a run-time exponent.
+    for _ in 0..4 {
+        let e = rng.random_range(0..(1u32 << 10));
+        let want = mod_pow(3, e);
+        assert_eq!(run(script! { {e} {field::pow_const_base(3, 10)} }), vec![want]);
+    }
+}
+
+fn mod_pow(mut b: u32, mut e: u32) -> u32 {
+    let mut acc = 1u32;
+    b %= P;
+    while e > 0 {
+        if e & 1 == 1 { acc = reference::mul(acc, b); }
+        b = reference::mul(b, b);
+        e >>= 1;
+    }
+    acc
+}
+
+/// The per-round scripts must chain to the whole permutation, and each must be
+/// small enough for a disprove transaction.
+#[test]
+fn rounds_compose_to_the_permutation() {
+    let mut rng = ChaCha20Rng::seed_from_u64(51);
+    let st: [u32; WIDTH] = core::array::from_fn(|_| rand_fe(&mut rng));
+    let mut want = st;
+    reference::permute(&mut want);
+
+    let rounds = poseidon2::permutation::rounds();
+    let chained = run(script! {
+        for x in st { {x} }
+        for r in rounds.iter() { { r.clone() } }
+    });
+    assert_eq!(chained, want.to_vec(), "chained rounds differ from permute()");
+}
+
+/// Every round must fit a standard transaction, or the disprove pattern has no
+/// atomic step to fall back on.
+#[test]
+fn every_round_fits_a_standard_transaction() {
+    const STD_TX: usize = 400_000;
+    let rounds = poseidon2::permutation::rounds();
+    let sizes: Vec<usize> = rounds.iter().map(|r| r.len()).collect();
+    let (min, max) = (sizes.iter().min().unwrap(), sizes.iter().max().unwrap());
+    let total: usize = sizes.iter().sum();
+
+    println!("\n  {} independently checkable rounds", rounds.len());
+    println!("  smallest round        {:>10} bytes", min);
+    println!("  largest round         {:>10} bytes  ({:.1}% of a standard tx)",
+             max, 100.0 * *max as f64 / STD_TX as f64);
+    println!("  all rounds together   {:>10} bytes", total);
+    println!("  one permutation       {:>10} bytes\n",
+             poseidon2::permutation::permute().len());
+
+    assert!(*max < STD_TX, "a round at {max} bytes exceeds MAX_STANDARD_TX_WEIGHT");
 }

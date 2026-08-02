@@ -163,3 +163,54 @@ pub fn mds_light_matrix() -> [[u32; WIDTH]; WIDTH] {
 pub fn internal_matrix() -> [[u32; WIDTH]; WIDTH] {
     matrix_of(internal_linear)
 }
+
+/// The Merkle compression, `TruncatedPermutation<_, 2, 8, 16>`: permute the
+/// concatenation of two eight-element digests and keep the first eight.
+pub fn compress(left: &[u32; 8], right: &[u32; 8]) -> [u32; 8] {
+    let mut state = [0u32; WIDTH];
+    state[..8].copy_from_slice(left);
+    state[8..].copy_from_slice(right);
+    permute(&mut state);
+    state[..8].try_into().unwrap()
+}
+
+/// Walk a Merkle path. `bits[i] == false` means the running digest is the left
+/// child at level `i`.
+pub fn merkle_root(leaf: [u32; 8], siblings: &[[u32; 8]], bits: &[bool]) -> [u32; 8] {
+    let mut cur = leaf;
+    for (sib, &bit) in siblings.iter().zip(bits.iter()) {
+        cur = if bit { compress(sib, &cur) } else { compress(&cur, sib) };
+    }
+    cur
+}
+
+/// Quartic extension arithmetic, `KoalaBear[X]/(X^4 - 3)`.
+pub mod ext4 {
+    use super::{add as fadd, mul as fmul, sub as fsub};
+    /// The non-residue.
+    pub const W: u32 = 3;
+
+    pub fn add(a: [u32; 4], b: [u32; 4]) -> [u32; 4] {
+        core::array::from_fn(|i| fadd(a[i], b[i]))
+    }
+
+    pub fn sub(a: [u32; 4], b: [u32; 4]) -> [u32; 4] {
+        core::array::from_fn(|i| fsub(a[i], b[i]))
+    }
+
+    /// Schoolbook, as Plonky3's generic `binomial_mul` branch does it.
+    pub fn mul(a: [u32; 4], b: [u32; 4]) -> [u32; 4] {
+        let mut res = [0u32; 4];
+        for i in 0..4 {
+            for j in 0..4 {
+                let t = fmul(a[i], b[j]);
+                if i + j >= 4 {
+                    res[i + j - 4] = fadd(res[i + j - 4], fmul(W, t));
+                } else {
+                    res[i + j] = fadd(res[i + j], t);
+                }
+            }
+        }
+        res
+    }
+}

@@ -1,21 +1,42 @@
-[package]
-name = "bitcoin-poseidon2-script"
+# bitcoin-stark-verifier: components of a post-quantum STARK verifier in Bitcoin Script.
+#
+# The crates are split along the boundary that matters for cost: `poseidon2` is
+# the hash and the field arithmetic under it, which is where essentially all of
+# a verifier's script weight goes. Everything above it — Merkle paths, the
+# low-degree test, AIR evaluation — is thin by comparison and will land in
+# sibling crates as it is written.
+[workspace]
+resolver = "2"
+members = ["poseidon2", "whir"]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2021"
-description = "Poseidon2 over KoalaBear in Bitcoin Script, without OP_CAT"
 license = "MIT"
 
-[dependencies]
-bitcoin-script = { git = "https://github.com/Bitcoin-Wildlife-Sanctuary/rust-bitcoin-script", tag = "1.0.0" }
+[workspace.dependencies]
 bitcoin = "0.32.0"
-
-[dev-dependencies]
+bitcoin-script = { git = "https://github.com/Bitcoin-Wildlife-Sanctuary/rust-bitcoin-script", tag = "1.0.0" }
 bitcoin-scriptexec = { git = "https://github.com/Bitcoin-Wildlife-Sanctuary/rust-bitcoin-scriptexec/", features = ["debug"], tag = "1.0.0" }
-rand = "0.9.1"
-rand_chacha = "0.9.0"
+bitvm-scriptexec = { package = "bitcoin-scriptexec", git = "https://github.com/BitVM/rust-bitcoin-scriptexec" }
 p3-field = { git = "https://github.com/Plonky3/Plonky3" }
 p3-koala-bear = { git = "https://github.com/Plonky3/Plonky3" }
 p3-symmetric = { git = "https://github.com/Plonky3/Plonky3" }
+# Plonky3's WHIR prover, for the end-to-end test: a real proof drives the
+# Bitcoin Script verifier.
+p3-whir = { git = "https://github.com/Plonky3/Plonky3" }
+p3-sumcheck = { git = "https://github.com/Plonky3/Plonky3", features = ["test-util"] }
+p3-challenger = { git = "https://github.com/Plonky3/Plonky3" }
+p3-commit = { git = "https://github.com/Plonky3/Plonky3" }
+p3-merkle-tree = { git = "https://github.com/Plonky3/Plonky3" }
+p3-dft = { git = "https://github.com/Plonky3/Plonky3" }
+p3-matrix = { git = "https://github.com/Plonky3/Plonky3" }
+p3-multilinear-util = { git = "https://github.com/Plonky3/Plonky3" }
+rand = "0.9.1"
+rand_chacha = "0.9.0"
+# Plonky3 pins rand 0.10, which has a different rand_core than the 0.9 the rest
+# of the tests use. The end-to-end test needs Plonky3's, so both are present.
+rand010 = { package = "rand", version = "0.10" }
 
 [profile.dev]
 opt-level = 3
