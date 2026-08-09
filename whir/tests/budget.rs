@@ -75,6 +75,9 @@ fn derive(
             // One row is the 2^folding_factor values of the fibre, as extension
             // elements -- four base elements each.
             row_len: 4 * (1 << r.folding_factor),
+            // Plonky3 derives this per round; the cost model only needs the
+            // exponent's bit width, which `log_domain_size` already gives.
+            domain_gen: 7,
         })
         .collect();
     let last = cfg.round_parameters.last().expect("at least one round");
@@ -84,6 +87,7 @@ fn derive(
         log_domain_size: last.domain_size.trailing_zeros() as usize - last.folding_factor,
         ood_samples: 0,
         row_len: 4 * (1 << last.folding_factor),
+        domain_gen: 7,
     };
     let queries: Vec<usize> = cfg.round_parameters.iter().map(|r| r.num_queries).collect();
     Ok((
