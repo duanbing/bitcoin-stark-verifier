@@ -174,16 +174,13 @@ pub fn final_check() -> Script {
 ///
 /// Two links remain outside the script, and neither is a matter of wiring:
 ///
-/// - **The round's answers are batched but not yet threaded through the
-///   schedule.** [`crate::constraint::combine_answers`] computes
-///   `sigma' = h_k(alpha_k) + sum_i gamma^(i+1) y_i`, and `w'` is carried
-///   symbolically until the final check collapses it into evaluations of `f_M`,
-///   which [`crate::multilinear::eval_multilinear`] already does — so no `eq`
-///   primitive is required. What remains is bookkeeping: carrying the
-///   accumulated points from round to round so the closing check knows where to
-///   evaluate.
-/// A row *is* now bound to its leaf — see [`open_query`] — so what remains is
-/// the constraint itself.
+/// - **The accumulated points are not threaded through the rounds.**
+///   [`crate::constraint::combine_answers`] computes each round's `sigma'` and
+///   [`crate::constraint::closing_check`] verifies the closing identity given
+///   the accumulated `(weight, point)` pairs, so both ends exist. What is
+///   missing is the bookkeeping between them: carrying the pairs from round to
+///   round, with the folding randomness substituted, so the closing check is
+///   handed the right list.
 ///
 /// So this is the part of the verifier that is *checked*, not the whole
 /// verifier. [`permutation_count`] prices the whole schedule including queries;

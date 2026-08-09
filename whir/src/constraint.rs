@@ -74,3 +74,73 @@ pub fn combine_answers(t: usize) -> Script {
         { ext4::add() }
     }
 }
+
+/// The closing check: `sum_j w_j * f_M(z_j) == sigma`, over `EF`.
+///
+/// # Why this is the whole of `w'`
+///
+/// A round never evaluates its weight polynomial; it carries it. After `M`
+/// rounds `w'` is a sum of terms `Z * gamma^e * eq(z, X)`, and the closing check
+/// asks for
+///
+/// ```text
+/// sum_b w'(f_M(b), b) = sigma
+/// ```
+///
+/// Each term collapses, because summing an evaluation against `eq` *is*
+/// evaluation:
+///
+/// ```text
+/// sum_b f_M(b) * gamma^e * eq(z, b) = gamma^e * f_M(z)
+/// ```
+///
+/// So the accumulated symbolic polynomial is exactly a list of
+/// `(weight, point)` pairs, and checking it is evaluating the final polynomial
+/// at each point and taking the weighted sum. That is why no `eq` primitive is
+/// needed anywhere in this verifier: `eq` appears only inside something that is
+/// never touched until it turns into an evaluation.
+///
+/// # Stack
+///
+/// In: `sigma(4) evals(4 * 2^n_vars)`, the final polynomial's evaluations with
+/// `e[0]` deepest. Altstack, per point in consumption order: the weight `w_j`,
+/// then the point's coordinates ordered so the *last* variable pops first —
+/// which is what [`crate::multilinear::eval_multilinear`] expects.
+/// Out: nothing. The spend is invalid unless the identity holds in all four
+/// coefficients.
+///
+/// # Cost
+///
+/// `n_points` multilinear evaluations of `n_vars` variables. The evaluations are
+/// copied rather than re-pushed, so the witness carries the final polynomial
+/// once. No permutation — this is arithmetic, and it is the reason
+/// `final_poly_vars` wants to stay small: the cost is
+/// `n_points * 2^n_vars` extension operations, exponential in the wrong variable
+/// if the folding schedule leaves too much to the end.
+pub fn closing_check(n_points: usize, n_vars: usize) -> Script {
+    let n = 1usize << n_vars; // evaluations in the final polynomial
+    script! {
+        // acc := 0
+        { ext4::push_zero() }
+        for _ in 0..n_points {
+            // Copy the evaluation block above the accumulator. The block's
+            // deepest element sits at a constant depth of `n` while the copy is
+            // being built: each push shifts the remainder by one, which cancels
+            // the step to the next element — the same cancellation
+            // `ext4::copy` relies on internally.
+            for _ in 0..n { { ext4::copy(n) } }
+            { crate::multilinear::eval_multilinear(n_vars) }
+            { ext4::from_altstack() }   // w_j
+            { ext4::mul() }
+            { ext4::add() }
+        }
+        // Compare the accumulator with sigma, which is beneath the evaluations.
+        { ext4::to_altstack() }
+        { ext4::drop_n(n) }
+        { ext4::from_altstack() }
+        for i in 0..ext4::D {
+            { ext4::D - i } OP_ROLL
+            OP_EQUALVERIFY
+        }
+    }
+}

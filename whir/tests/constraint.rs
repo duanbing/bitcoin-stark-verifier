@@ -164,3 +164,105 @@ fn the_batching_challenge_matters() {
     g2[0] = pf::add(g2[0], 1);
     assert_ne!(with(g), with(g2), "sigma' is independent of gamma");
 }
+
+// ---------------------------------------------------------------------------
+// The closing check
+// ---------------------------------------------------------------------------
+
+/// Load one point: the weight first, then coordinates so the last variable pops
+/// first — the order `eval_multilinear` consumes them in.
+fn point_to_altstack(w: [u32; 4], z: &[[u32; 4]]) -> bitcoin::ScriptBuf {
+    script! {
+        { push_ef(w) } for _ in 0..4 { OP_TOALTSTACK }
+        for c in z.iter() { { push_ef(*c) } for _ in 0..4 { OP_TOALTSTACK } }
+    }
+}
+
+fn closing_script(
+    sigma: [u32; 4],
+    evals: &[[u32; 4]],
+    pts: &[([u32; 4], Vec<[u32; 4]>)],
+    n_vars: usize,
+) -> bitcoin::ScriptBuf {
+    script! {
+        for (w, z) in pts.iter().rev() { { point_to_altstack(*w, z) } }
+        { push_ef(sigma) }
+        for e in evals.iter() { { push_ef(*e) } }
+        { constraint::closing_check(pts.len(), n_vars) }
+        OP_TRUE
+    }
+}
+
+#[test]
+fn closing_check_accepts_the_accumulated_sum() {
+    let mut rng = ChaCha20Rng::seed_from_u64(45);
+    for (n_vars, n_points) in [(1usize, 1usize), (2, 3), (3, 5), (4, 2)] {
+        let evals: Vec<[u32; 4]> = (0..(1 << n_vars)).map(|_| rand_ef(&mut rng)).collect();
+        let pts: Vec<([u32; 4], Vec<[u32; 4]>)> = (0..n_points)
+            .map(|_| (rand_ef(&mut rng), (0..n_vars).map(|_| rand_ef(&mut rng)).collect()))
+            .collect();
+        let sigma = reference::closing_sum(&evals, &pts);
+
+        let ok = bitcoin_scriptexec::execute_script(closing_script(sigma, &evals, &pts, n_vars));
+        assert!(
+            ok.error.is_none(),
+            "{n_vars} vars, {n_points} points: rejected: {:?}",
+            ok.error
+        );
+    }
+}
+
+/// Wrong target, wrong weight, wrong point, wrong polynomial — all rejected.
+///
+/// Each of these is a distinct way for the closing check to be vacuous, and the
+/// previous incarnation of `final_check` was vacuous in the first way.
+#[test]
+fn closing_check_rejects_every_perturbation() {
+    let mut rng = ChaCha20Rng::seed_from_u64(46);
+    let (n_vars, n_points) = (3usize, 4usize);
+    let evals: Vec<[u32; 4]> = (0..(1 << n_vars)).map(|_| rand_ef(&mut rng)).collect();
+    let pts: Vec<([u32; 4], Vec<[u32; 4]>)> = (0..n_points)
+        .map(|_| (rand_ef(&mut rng), (0..n_vars).map(|_| rand_ef(&mut rng)).collect()))
+        .collect();
+    let sigma = reference::closing_sum(&evals, &pts);
+
+    let rejects = |s: bitcoin::ScriptBuf, why: &str| {
+        assert!(bitcoin_scriptexec::execute_script(s).error.is_some(), "{why}: accepted");
+    };
+
+    for c in 0..4 {
+        let mut bad = sigma;
+        bad[c] = pf::add(bad[c], 1);
+        rejects(closing_script(bad, &evals, &pts, n_vars), &format!("sigma coefficient {c}"));
+    }
+    for j in 0..n_points {
+        let mut bad = pts.clone();
+        bad[j].0[0] = pf::add(bad[j].0[0], 1);
+        rejects(closing_script(sigma, &evals, &bad, n_vars), &format!("weight {j}"));
+
+        let mut bad = pts.clone();
+        bad[j].1[0][0] = pf::add(bad[j].1[0][0], 1);
+        rejects(closing_script(sigma, &evals, &bad, n_vars), &format!("point {j}"));
+    }
+    for i in 0..evals.len() {
+        let mut bad = evals.clone();
+        bad[i][0] = pf::add(bad[i][0], 1);
+        rejects(closing_script(sigma, &bad, &pts, n_vars), &format!("final polynomial coeff {i}"));
+    }
+}
+
+/// What the closing check costs, so the folding schedule can be argued about.
+#[test]
+fn report_closing_check_size() {
+    println!("\n  closing check: n_points x eval_multilinear(n_vars)");
+    println!("  ------------------------------------------------");
+    for n_vars in [2usize, 3, 4, 5] {
+        let one = constraint::closing_check(1, n_vars).len();
+        let ten = constraint::closing_check(10, n_vars).len();
+        println!(
+            "  n_vars = {n_vars}:  1 point {one:>10} B   10 points {ten:>11} B   per point {:>10} B",
+            (ten - one) / 9
+        );
+    }
+    println!();
+}
