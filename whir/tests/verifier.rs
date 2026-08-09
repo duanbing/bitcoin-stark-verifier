@@ -747,3 +747,97 @@ fn report_closing_size() {
         100.0 * closing as f64 / whole as f64
     );
 }
+
+/// The closing check's inputs, before it multiplies them.
+///
+/// A single `OP_EQUALVERIFY` at the end says only that something disagreed.
+/// Pinning `f_M(r_fin)` on its own -- and that the claim and the randomness are
+/// where they were -- turns that into a location. It found the bug it was
+/// written for: the coordinates were copied from the top down, and the altstack
+/// being last-in-first-out meant `eval_multilinear` then read the point
+/// backwards.
+#[test]
+fn the_closing_inputs_match_the_reference() {
+    let mut rng = ChaCha20Rng::seed_from_u64(24);
+    let cfg = small();
+    let state0: [u32; 16] = core::array::from_fn(|_| rand_f(&mut rng));
+    let claim0 = rand_ef(&mut rng);
+    let c = build_closing(&cfg, &mut rng, state0, claim0);
+    let m = total_folding_vars(&cfg);
+    let v = cfg.final_poly_vars;
+    let n_evals = 1usize << v;
+    let lift = 4 * n_evals + 4 * m + 4 - 1;
+
+    let got = run_ok(script! {
+        { constraint_to_altstack(c.weight, &c.point) }
+        { push_altstack(&c.spine.items) }
+        { push_ef(claim0) }
+        for s in state0 { {s} }
+        { verifier::verify(&cfg) }
+        for _ in 0..16 { OP_DROP }
+        for _ in 0..(4 * n_evals) { { lift } OP_ROLL }
+        for i in (0..v).rev() {
+            { poseidon2::ext4::copy(n_evals + 1 + i) } { poseidon2::ext4::to_altstack() }
+        }
+        { whir::multilinear::eval_multilinear(v) }
+    });
+    let f_at_r = reference::eval_multilinear(&c.spine.final_poly, &c.spine.randomness[m - v..]);
+    assert_eq!(&got[got.len() - 4..], &f_at_r, "f_M(r_fin) disagrees");
+    assert_eq!(&got[got.len() - 8..got.len() - 4], &c.spine.claim, "the claim moved");
+    assert_eq!(&got[..4 * m], c.spine.randomness.concat().as_slice(), "the randomness moved");
+}
+
+/// One query opening, in the position the schedule puts it in.
+///
+/// `open_query` had no test at all until now, which is how its stack contract
+/// came to be unsatisfiable: it sampled the index with a pick that reaches into
+/// the top sixteen slots while an opening sat on top of them.
+#[test]
+fn one_opening_authenticates_against_the_commitment() {
+    let mut rng = ChaCha20Rng::seed_from_u64(30);
+    let depth = 4usize;
+    let row_len = 4usize;
+    let tree = build_tree(depth, row_len, &mut rng);
+    let state: [u32; 16] = core::array::from_fn(|_| rand_f(&mut rng));
+    // Stand-ins for the randomness and the claim the commitment is buried under.
+    let r_len = 2usize;
+    let commit_depth = 16 + 4 + 4 * r_len + 8 - 1;
+
+    for slot in [0usize, 3, 7] {
+        let index = reference::sample_bits(state[slot], depth) as usize;
+        let mut opening = Vec::new();
+        for sib in tree.siblings(index).iter().rev() {
+            opening.extend_from_slice(sib);
+        }
+        opening.extend_from_slice(&tree.rows[index]);
+
+        let accepted = |root: [u32; 8], opening: &[u32]| {
+            bitcoin_scriptexec::execute_script(script! {
+                { push_altstack(opening) }
+                for x in root { {x} }
+                for _ in 0..(4 * r_len) { 7 }
+                for _ in 0..4 { 9 }
+                for s in state { {s} }
+                { verifier::open_query(slot, depth, row_len, commit_depth) }
+                OP_TRUE
+            })
+            .error
+            .is_none()
+        };
+
+        assert!(accepted(tree.root, &opening), "slot {slot} (index {index}) was rejected");
+
+        // A different committed root is what the walk is checked against, so
+        // opening the same path under it must fail -- this is the property that
+        // was missing when the root came from the witness.
+        let mut wrong = tree.root;
+        wrong[0] = pf::add(wrong[0], 1);
+        assert!(!accepted(wrong, &opening), "slot {slot}: a wrong commitment was accepted");
+
+        // And the row is bound to the leaf, not merely alongside it.
+        let mut tampered = opening.clone();
+        let last = tampered.len() - 1;
+        tampered[last] = pf::add(tampered[last], 1);
+        assert!(!accepted(tree.root, &tampered), "slot {slot}: a tampered row was accepted");
+    }
+}
