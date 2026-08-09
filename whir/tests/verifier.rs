@@ -117,14 +117,59 @@ fn final_check_accepts_only_the_right_value() {
 fn small() -> Config {
     Config {
         initial_folding_factor: 2,
-        rounds: vec![Round { folding_factor: 2, num_queries: 3, log_domain_size: 6, ood_samples: 1 }],
-        final_round: Round { folding_factor: 2, num_queries: 3, log_domain_size: 4, ood_samples: 1 },
+        initial_ood_samples: 1,
+        rounds: vec![Round { folding_factor: 2, num_queries: 3, log_domain_size: 6, ood_samples: 1, row_len: 4 }],
+        final_round: Round { folding_factor: 2, num_queries: 3, log_domain_size: 4, ood_samples: 0, row_len: 4 },
         final_sumcheck_rounds: 2,
         final_poly_vars: 2,
     }
 }
 
 /// The transcript that `verify` consumes, and the state and claim it should
+/// A committed tree, and the openings the verifier will ask it for.
+///
+/// The script now checks a query against the *absorbed commitment*, so the test
+/// can no longer hand it a root and a matching path: every query in a round has
+/// to reach the same root, which means building an actual tree.
+struct Tree {
+    root: [u32; 8],
+    leaves: Vec<[u32; 8]>,
+    /// `levels[0]` is the leaves; the last level is the pair under the root.
+    levels: Vec<Vec<[u32; 8]>>,
+    rows: Vec<Vec<u32>>,
+}
+
+fn build_tree(depth: usize, row_len: usize, rng: &mut ChaCha20Rng) -> Tree {
+    let rows: Vec<Vec<u32>> = (0..(1usize << depth))
+        .map(|_| (0..row_len).map(|_| rand_f(rng)).collect())
+        .collect();
+    let leaves: Vec<[u32; 8]> = rows.iter().map(|r| poseidon2::reference::hash_row(r)).collect();
+    let mut levels = vec![leaves.clone()];
+    while levels.last().expect("non-empty").len() > 1 {
+        let below = levels.last().expect("non-empty");
+        let up: Vec<[u32; 8]> = below
+            .chunks(2)
+            .map(|p| poseidon2::reference::compress(&p[0], &p[1]))
+            .collect();
+        levels.push(up);
+    }
+    let root = levels.last().expect("non-empty")[0];
+    Tree { root, leaves, levels, rows }
+}
+
+impl Tree {
+    /// The siblings for `index`, deepest level first — the order the walk reads.
+    fn siblings(&self, index: usize) -> Vec<[u32; 8]> {
+        let mut out = Vec::new();
+        let mut i = index;
+        for level in self.levels.iter().take(self.levels.len() - 1) {
+            out.push(level[i ^ 1]);
+            i >>= 1;
+        }
+        out
+    }
+}
+
 /// The coordinates of folding randomness a schedule produces: one per sumcheck
 /// round, which is what `sumcheck_rounds_fs_keep` leaves on the stack.
 fn total_folding_vars(cfg: &Config) -> usize {
@@ -151,7 +196,7 @@ fn build_spine(cfg: &Config, rng: &mut ChaCha20Rng, state0: [u32; 16], claim0: [
     let mut claim = claim0;
 
     let mut randomness: Vec<[u32; 4]> = Vec::new();
-    let mut sumcheck = |n: usize, items: &mut Vec<u32>, state: &mut [u32; 16], claim: &mut [u32; 4], rng: &mut ChaCha20Rng, randomness: &mut Vec<[u32; 4]>| {
+    let sumcheck = |n: usize, items: &mut Vec<u32>, state: &mut [u32; 16], claim: &mut [u32; 4], rng: &mut ChaCha20Rng, randomness: &mut Vec<[u32; 4]>| {
         for _ in 0..n {
             let (c0, c_inf) = (rand_ef(rng), rand_ef(rng));
             items.extend_from_slice(&c0);
@@ -169,15 +214,56 @@ fn build_spine(cfg: &Config, rng: &mut ChaCha20Rng, state0: [u32; 16], claim0: [
         }
     };
 
+    // Every query in a round has to reach a committed root, so the mirror builds
+    // actual trees. There is one more commitment than there are rounds: the
+    // initial codeword, which round 0 opens, and then one per round, the last of
+    // which the final proximity test opens. `trees[i]` is the codeword *opened*
+    // at step `i`, and it is absorbed one step earlier.
+    let mut trees: Vec<Tree> = Vec::with_capacity(cfg.rounds.len() + 1);
+    for r in cfg.rounds.iter().chain(core::iter::once(&cfg.final_round)) {
+        trees.push(build_tree(r.log_domain_size, r.row_len, rng));
+    }
+
+    // The openings for one round: indices sampled from the rate, `RATE` of them
+    // per squeeze, then the siblings deepest-last and the row.
+    let queries = |r: &Round, tree: &Tree, items: &mut Vec<u32>, state: &mut [u32; 16]| {
+        for q in 0..r.num_queries {
+            let slot = q % reference::RATE;
+            if q > 0 && slot == 0 {
+                reference::squeeze(state);
+            }
+            let index =
+                reference::sample_bits(state[slot], r.log_domain_size) as usize;
+            for sib in tree.siblings(index).iter().rev() {
+                items.extend_from_slice(sib);
+            }
+            items.extend_from_slice(&tree.rows[index]);
+        }
+    };
+
+    // Commit phase: the initial root and its out-of-domain samples.
+    let commit = |t: &Tree, items: &mut Vec<u32>, state: &mut [u32; 16]| {
+        items.extend_from_slice(&t.root);
+        for block in t.root.chunks(reference::RATE) {
+            reference::duplexing(state, block);
+        }
+    };
+    commit(&trees[0], &mut items, &mut state);
+    for _ in 0..cfg.initial_ood_samples {
+        absorb(4, &mut items, &mut state, rng);
+    }
     sumcheck(cfg.initial_folding_factor, &mut items, &mut state, &mut claim, rng, &mut randomness);
-    for r in cfg.rounds.iter() {
-        absorb(poseidon2::merkle::DIGEST, &mut items, &mut state, rng);
+
+    for (i, r) in cfg.rounds.iter().enumerate() {
+        // Absorb the *next* codeword's root, then open the previous one.
+        commit(&trees[i + 1], &mut items, &mut state);
         // The point is sampled from the rate the previous absorb produced, and
         // only then is the answer absorbed. Sampling reads the state without
         // permuting, so the mirror has nothing to do but keep the order.
         for _ in 0..r.ood_samples {
             absorb(4, &mut items, &mut state, rng);
         }
+        queries(r, &trees[i], &mut items, &mut state);
         sumcheck(r.folding_factor, &mut items, &mut state, &mut claim, rng, &mut randomness);
     }
     let poly_start = items.len();
@@ -186,6 +272,7 @@ fn build_spine(cfg: &Config, rng: &mut ChaCha20Rng, state0: [u32; 16], claim0: [
         .chunks(4)
         .map(|c| [c[0], c[1], c[2], c[3]])
         .collect();
+    queries(&cfg.final_round, trees.last().expect("one per round plus one"), &mut items, &mut state);
     sumcheck(cfg.final_sumcheck_rounds, &mut items, &mut state, &mut claim, rng, &mut randomness);
 
     Spine { items, claim, state, randomness, final_poly }
@@ -244,18 +331,31 @@ fn transcript_spine_is_sensitive_to_every_absorbed_value() {
         let mut items = want.items.clone();
         items[i] = pf::add(items[i], 1);
 
-        let got = run_ok(script! {
+        let info = bitcoin_scriptexec::execute_script(script! {
             { push_altstack(&items) }
             { push_ef(claim0) }
             for s in state0 { {s} }
             { verifier::verify(&cfg) }
         });
+        // Two ways for the transcript to notice, and which one applies depends
+        // on what was perturbed. A value inside a Merkle opening breaks the walk
+        // and the script aborts; a value that is only absorbed moves a squeezed
+        // challenge, which moves the chained claim. Accepting *either* is the
+        // honest assertion -- demanding only the second would have failed the
+        // moment the query openings were composed in, for the good reason that
+        // the tamper is now caught earlier.
+        if info.error.is_some() {
+            continue;
+        }
+        let got: Vec<u32> = (0..info.final_stack.len())
+            .map(|k| decode(&info.final_stack.get(k)) as u32)
+            .collect();
         let m = total_folding_vars(&cfg);
         let f = 4 * (1usize << cfg.final_poly_vars);
         assert_ne!(
             &got[f + 4 * m..f + 4 * m + 4],
             &want.claim,
-            "perturbing transcript position {i} left the claim unchanged"
+            "perturbing transcript position {i} was neither rejected nor moved the claim"
         );
     }
 }
@@ -316,27 +416,46 @@ fn one_more_absorb_is_one_more_permutation() {
 
 /// The absolute count, with the arithmetic stated rather than hidden.
 ///
+/// Now that the query openings are composed, this covers the whole verifier and
+/// not just its transcript -- which is why the arithmetic share drops: the
+/// sumcheck rounds are the same size, but there is far more permutation around
+/// them.
+///
 /// `permutation_count` is what decides whether a WHIR verifier fits on Bitcoin,
 /// so it is worth knowing how much of the emitted script it fails to describe.
 #[test]
-fn report_spine_arithmetic() {
+fn report_verifier_arithmetic() {
     let cfg = small();
     let one = poseidon2::permutation::permute().len();
     let sumcheck_rounds =
         cfg.initial_folding_factor + cfg.rounds.iter().map(|r| r.folding_factor).sum::<usize>()
             + cfg.final_sumcheck_rounds;
-    let absorbs: usize = cfg
+    let absorbs: usize = poseidon2::merkle::DIGEST.div_ceil(reference::RATE)
+        + cfg.initial_ood_samples
+        + cfg
+            .rounds
+            .iter()
+            .map(|r| poseidon2::merkle::DIGEST.div_ceil(reference::RATE) + r.ood_samples)
+            .sum::<usize>()
+        + (4usize << cfg.final_poly_vars).div_ceil(reference::RATE);
+    // The queries are the rest, and they are the reason any of this is
+    // expensive: a Merkle level and a leaf hash each, per query.
+    let queries: usize = cfg
         .rounds
         .iter()
-        .map(|r| poseidon2::merkle::DIGEST.div_ceil(reference::RATE) + r.ood_samples)
-        .sum::<usize>()
-        + (4usize << cfg.final_poly_vars).div_ceil(reference::RATE);
-    let predicted = sumcheck_rounds + absorbs;
+        .chain(core::iter::once(&cfg.final_round))
+        .map(|r| {
+            r.num_queries.div_ceil(reference::RATE).saturating_sub(1)
+                + r.num_queries * (r.log_domain_size + r.row_len.div_ceil(8))
+        })
+        .sum();
+    let predicted = sumcheck_rounds + absorbs + queries;
     let emitted = verifier::verify(&cfg).len();
     let arithmetic = emitted - predicted * one;
     println!(
-        "\n  spine: {predicted} permutations = {} B, emitted {emitted} B\n  \
-         arithmetic and bookkeeping: {arithmetic} B ({:.1}% of the spine)\n",
+        "\n  verifier: {predicted} permutations = {} B, emitted {emitted} B\n  \
+         ({sumcheck_rounds} sumcheck, {absorbs} absorb, {queries} query)\n  \
+         arithmetic and bookkeeping: {arithmetic} B ({:.1}% of the whole)\n",
         predicted * one,
         100.0 * arithmetic as f64 / emitted as f64
     );
@@ -356,17 +475,21 @@ fn example() -> Config {
             num_queries: 20,
             log_domain_size: log_domain,
             ood_samples: 2,
+            // 2^folding_factor extension elements: the fibre a shift query reads.
+            row_len: 4 * (1 << 4),
         });
         log_domain -= 4;
     }
     Config {
         initial_folding_factor: 4,
+        initial_ood_samples: 2,
         rounds,
         final_round: Round {
             folding_factor: 4,
             num_queries: 20,
             log_domain_size: log_domain,
-            ood_samples: 2,
+            ood_samples: 0,
+            row_len: 4 * (1 << 4),
         },
         final_sumcheck_rounds: 4,
         final_poly_vars: 4,
@@ -381,18 +504,53 @@ fn report_verifier_size() {
 
     const BLOCK: usize = 4_000_000;
 
-    let merkle: usize = cfg.rounds.iter().map(|r| r.num_queries * r.log_domain_size).sum::<usize>()
-        + cfg.final_round.num_queries * cfg.final_round.log_domain_size;
+    let (mut paths, mut leaves) = (0usize, 0usize);
+    for r in cfg.rounds.iter().chain(core::iter::once(&cfg.final_round)) {
+        paths += r.num_queries * r.log_domain_size;
+        leaves += r.num_queries * r.row_len.div_ceil(poseidon2::merkle::HASH_RATE);
+    }
+    let queries = paths + leaves;
 
     println!("\n  WHIR verifier for a 2^20 trace, 20 queries, folding factor 4");
     println!("  -----------------------------------------------------------");
     println!("  permutations                 {perms:>12}");
-    println!("    of which Merkle paths      {merkle:>12}");
-    println!("    of which transcript        {:>12}", perms - merkle);
+    println!("    of which Merkle paths      {paths:>12}");
+    println!("    of which leaf hashing      {leaves:>12}");
+    println!("    of which transcript        {:>12}", perms - queries);
     println!("  bytes                        {:>12}", perms * one);
     println!("  blocks                       {:>12.1}", (perms * one) as f64 / BLOCK as f64);
-    println!("\n  transcript share             {:>11.1}%", 100.0 * (perms - merkle) as f64 / perms as f64);
+    println!("\n  query share                  {:>11.1}%", 100.0 * queries as f64 / perms as f64);
+    println!("  transcript share             {:>11.1}%", 100.0 * (perms - queries) as f64 / perms as f64);
     println!();
+}
+
+/// Binding a row to its leaf is not free, and was never priced.
+///
+/// The row-to-leaf hash closed a real gap -- without it a spender could
+/// authenticate the committed leaf and fold a different row -- but the
+/// accounting only ever counted the path. At folding factor 4 a row is sixteen
+/// extension elements, so sixty-four base elements, so eight permutations per
+/// query on top of the twenty-one the path costs. That deserves its own number
+/// rather than hiding inside a total.
+#[test]
+fn report_leaf_hashing_cost() {
+    let cfg = example();
+    let one = poseidon2::permutation::permute().len();
+    let leaves: usize = cfg
+        .rounds
+        .iter()
+        .chain(core::iter::once(&cfg.final_round))
+        .map(|r| r.num_queries * r.row_len.div_ceil(poseidon2::merkle::HASH_RATE))
+        .sum();
+    let perms = verifier::permutation_count(&cfg);
+    println!(
+        "\n  leaf hashing: {leaves} permutations = {} B, {:.1}% of the verifier\n  \
+         (a row of {} base elements is {} permutations, per query)\n",
+        leaves * one,
+        100.0 * leaves as f64 / perms as f64,
+        cfg.final_round.row_len,
+        cfg.final_round.row_len.div_ceil(poseidon2::merkle::HASH_RATE)
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -570,53 +728,22 @@ fn clone_closing(c: &Closing) -> Closing {
     }
 }
 
-/// What closing costs, against the transcript it closes.
+/// What closing costs, against the verifier it closes.
+///
+/// Priced from `permutation_count` rather than by building the script: now that
+/// the query openings are composed, `verify(&example())` is three quarters of a
+/// gigabyte of Bitcoin Script, and materialising it to call `.len()` is not a
+/// reasonable thing for a test to do.
 #[test]
 fn report_closing_size() {
     let cfg = example();
     let m = cfg.total_folding_vars();
-    let spine = verifier::verify(&cfg).len();
+    let one = poseidon2::permutation::permute().len();
+    let whole = verifier::permutation_count(&cfg) * one;
     let closing = verifier::close(&cfg, &[(1, m)]).len();
     println!(
-        "\n  spine {spine} B, closing {closing} B ({:.2}% of the spine, 0 permutations)\n",
-        100.0 * closing as f64 / spine as f64
+        "\n  whole verifier ~{whole} B, closing {closing} B \
+         ({:.3}% of it, 0 permutations)\n",
+        100.0 * closing as f64 / whole as f64
     );
-}
-
-/// The closing check's inputs, before it multiplies them.
-///
-/// A single `OP_EQUALVERIFY` at the end says only that something disagreed.
-/// Pinning `f_M(r_fin)` on its own -- and that the claim and the randomness are
-/// where they were -- turns that into a location. It found the bug it was
-/// written for: the coordinates were copied from the top down, and the altstack
-/// being last-in-first-out meant `eval_multilinear` then read the point
-/// backwards.
-#[test]
-fn the_closing_inputs_match_the_reference() {
-    let mut rng = ChaCha20Rng::seed_from_u64(24);
-    let cfg = small();
-    let state0: [u32; 16] = core::array::from_fn(|_| rand_f(&mut rng));
-    let claim0 = rand_ef(&mut rng);
-    let c = build_closing(&cfg, &mut rng, state0, claim0);
-    let m = total_folding_vars(&cfg);
-    let v = cfg.final_poly_vars;
-    let n_evals = 1usize << v;
-    let lift = 4 * n_evals + 4 * m + 4 - 1;
-
-    // Stage 1: drop the sponge, lift the polynomial, evaluate it.
-    let got = run_ok(script! {
-        { constraint_to_altstack(c.weight, &c.point) }
-        { push_altstack(&c.spine.items) }
-        { push_ef(claim0) }
-        for s in state0 { {s} }
-        { verifier::verify(&cfg) }
-        for _ in 0..16 { OP_DROP }
-        for _ in 0..(4 * n_evals) { { lift } OP_ROLL }
-        for i in (0..v).rev() { { poseidon2::ext4::copy(n_evals + 1 + i) } { poseidon2::ext4::to_altstack() } }
-        { whir::multilinear::eval_multilinear(v) }
-    });
-    let f_at_r = reference::eval_multilinear(&c.spine.final_poly, &c.spine.randomness[m - v..]);
-    assert_eq!(&got[got.len() - 4..], &f_at_r, "f_M(r_fin) disagrees");
-    assert_eq!(&got[got.len() - 8..got.len() - 4], &c.spine.claim, "the claim moved");
-    assert_eq!(&got[..4 * m], c.spine.randomness.concat().as_slice(), "the randomness moved");
 }

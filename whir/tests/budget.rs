@@ -72,6 +72,9 @@ fn derive(
             num_queries: r.num_queries,
             log_domain_size: r.domain_size.trailing_zeros() as usize - r.folding_factor,
             ood_samples: r.ood_samples,
+            // One row is the 2^folding_factor values of the fibre, as extension
+            // elements -- four base elements each.
+            row_len: 4 * (1 << r.folding_factor),
         })
         .collect();
     let last = cfg.round_parameters.last().expect("at least one round");
@@ -80,11 +83,13 @@ fn derive(
         num_queries: cfg.final_queries,
         log_domain_size: last.domain_size.trailing_zeros() as usize - last.folding_factor,
         ood_samples: 0,
+        row_len: 4 * (1 << last.folding_factor),
     };
     let queries: Vec<usize> = cfg.round_parameters.iter().map(|r| r.num_queries).collect();
     Ok((
         Config {
             initial_folding_factor: cfg.folding_schedule[0],
+            initial_ood_samples: cfg.commitment_ood_samples,
             rounds,
             final_round,
             final_sumcheck_rounds: cfg.final_sumcheck_rounds,
@@ -122,10 +127,7 @@ fn one_query_against_a_transaction() {
                     }
                 };
                 let depth = cfg.rounds[0].log_domain_size;
-                // The row is 2^folding_factor extension elements; the leaf hash
-                // absorbs them RATE at a time.
-                let row = 4 * (1usize << cfg.rounds[0].folding_factor);
-                let per_query = depth + row.div_ceil(8);
+                let per_query = depth + cfg.rounds[0].row_len.div_ceil(8);
                 let bytes = per_query * one;
                 println!(
                     "  {security:>3} pow{pow:<3} {vars:>4} {:>8} {:>11} {depth:>10} {:>11} B {:>9.2}",

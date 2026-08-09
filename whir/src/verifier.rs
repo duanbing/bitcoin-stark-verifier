@@ -38,6 +38,9 @@ pub struct Round {
     pub log_domain_size: usize,
     /// Out-of-domain samples absorbed with the commitment.
     pub ood_samples: usize,
+    /// Field elements in one opened row — the `2^folding_factor` values of the
+    /// fibre a shift query reads, which is what a Merkle leaf commits to.
+    pub row_len: usize,
 }
 
 /// A WHIR instance, mirroring the fields of `WhirConfig` this verifier reads.
@@ -45,6 +48,9 @@ pub struct Round {
 pub struct Config {
     /// Sumcheck rounds before the first folding round.
     pub initial_folding_factor: usize,
+    /// Out-of-domain samples taken with the *initial* commitment, in the commit
+    /// phase before the protocol proper.
+    pub initial_ood_samples: usize,
     pub rounds: Vec<Round>,
     /// The final round's queries.
     pub final_round: Round,
@@ -158,7 +164,7 @@ fn absorb_n_from_altstack_keep(n: usize, r_len: usize) -> Script {
 ///
 /// `slot` selects which rate element the index is read from. One squeeze yields
 /// `RATE` of them and the caller must re-squeeze once they are spent — see
-/// [`queries_per_squeeze`]. The previous version hardcoded slot 0, and since
+/// [`queries_per_squeeze`]. The first version hardcoded slot 0, and since
 /// [`challenger::sample`] is a bare `OP_PICK` that neither permutes nor advances
 /// any buffer, every query in a round derived the *same* index and opened the
 /// *same* leaf. However many queries were configured, the soundness was that of
@@ -175,18 +181,101 @@ fn absorb_n_from_altstack_keep(n: usize, r_len: usize) -> Script {
 /// nothing stops a spender authenticating the real leaf and folding a different
 /// row into the constraint. Hashing in script removes the seam.
 ///
-/// Stack: the opening pushed as `root(8) siblings(8*depth) row(row_len)`.
-/// Consumes all of it and leaves nothing, so the caller's layout is preserved.
-/// `low_bits_to_altstack` puts the index bits underneath, and
-/// [`merkle::hash_row`] leaves the altstack as it found it, so the walk still
-/// finds them.
-pub fn open_query(slot: usize, log_domain_size: usize, row_len: usize) -> Script {
+/// # The root is not the spender's to supply
+///
+/// The first version took the root from the witness alongside the siblings, so
+/// a spender could commit to one tree and open a path in another: any root with
+/// any consistent path would pass, and the round's commitment — the thing the
+/// transcript absorbed — was never compared against. The root is now copied
+/// from that absorbed commitment, kept on the stack for the round by
+/// [`absorb_n_from_altstack_keep`], which is the third time in this crate a
+/// value has turned out to be absorbed and then not retained.
+///
+/// # Stack
+///
+/// In: `... commit(8) claim(4) state(16)`, the sponge on top as everywhere else
+/// and the round's commitment beneath the claim.
+/// Altstack: the opening, in pop order — the siblings deepest last, then the
+/// row. No root: it comes from the commitment.
+/// Out: unchanged. The spend is invalid unless the walk reaches that root.
+///
+/// # Why the opening comes from the altstack, and in that order
+///
+/// The first version took the opening from the main stack and sampled the index
+/// with [`challenger::sample`], which picks within the top sixteen slots. With
+/// an opening on top of the state those picks land in the row, so the contract
+/// could not hold — and nothing caught it, because the builder had no test that
+/// executed it. It is the same shape as the defect that made `verify` a cost
+/// model: a script that is measured but never run.
+///
+/// The order is forced. The direction bits go on the altstack, so the opening
+/// has to come off it first or the bits would be popped in the opening's place;
+/// and the index has to be sampled with the opening already above the state,
+/// which is what [`challenger::sample_at`] is for.
+pub fn open_query(
+    slot: usize,
+    log_domain_size: usize,
+    row_len: usize,
+    commit_depth: usize,
+) -> Script {
+    let witness = merkle::DIGEST * log_domain_size + row_len;
+    let opening = merkle::DIGEST + witness;
     script! {
-        { challenger::sample(slot) }
+        // The root the walk has to reach, taken from the commitment rather than
+        // from the spender, and placed where `merkle_verify` expects it.
+        for _ in 0..merkle::DIGEST { { commit_depth } OP_PICK }
+        for _ in 0..witness { OP_FROMALTSTACK }
+        { challenger::sample_at(slot, opening) }
         { field::low_bits_to_altstack(log_domain_size) }
         { merkle::hash_row(row_len) }
         { merkle::merkle_verify_from_altstack(log_domain_size) }
     }
+}
+
+/// Every query of one round, with the re-squeezes its indices need.
+///
+/// A squeeze yields [`queries_per_squeeze`] rate slots, so a round with more
+/// queries than that has to permute again part-way through. That cost is real —
+/// it is in [`permutation_count`] — and it is the only thing in the schedule
+/// whose permutation count is not one per absorb.
+///
+/// # Stack
+///
+/// In and out: `... commit(8) claim(4) state(16)`. Altstack: the openings back
+/// to back, in query order.
+fn open_round_queries(r: &Round, commit_depth: usize) -> Script {
+    let queries: Vec<Script> = (0..r.num_queries)
+        .map(|q| {
+            let slot = q % queries_per_squeeze();
+            script! {
+                // A fresh squeeze once the previous batch of slots is spent.
+                if q > 0 && slot == 0 { { sponge::squeeze() } }
+                { open_query(slot, r.log_domain_size, r.row_len, commit_depth) }
+            }
+        })
+        .collect();
+    script! { for q in queries { { q } } }
+}
+
+/// Depth of a commitment's deepest slot, given what is stacked above it.
+///
+/// A commitment is buried *below* the folding randomness rather than under the
+/// claim, and this is not a matter of taste: a sumcheck round buries its
+/// challenge directly under the claim, so a commitment parked there would land
+/// inside `R` and stop [`crate::constraint::constraint_eval`] reading a suffix.
+/// Below `R` it survives the round's sumcheck rounds untouched, which is what a
+/// commitment has to do — its queries are opened after them.
+const fn commitment_depth(r_len: usize, above: usize) -> usize {
+    sponge::WIDTH + ext4::D + ext4::D * r_len + above + merkle::DIGEST - 1
+}
+
+/// Drop the round's commitment from under the claim and the sponge.
+///
+/// Rolled up one slot at a time rather than parked on the altstack: the altstack
+/// holds the rest of the transcript, and anything pushed there would be popped
+/// in its place.
+fn drop_commitment(depth: usize) -> Script {
+    script! { for j in 0..merkle::DIGEST { { depth - j } OP_ROLL OP_DROP } }
 }
 
 /// Query indices available from one squeeze.
@@ -258,13 +347,19 @@ pub fn final_check() -> Script {
 /// the two numbers are deliberately different and the doc comment on each says
 /// which it is.
 pub fn verify(cfg: &Config) -> Script {
-    script! {
-        { sumcheck::sumcheck_rounds_fs_keep(cfg.initial_folding_factor) }
-
-        for r in cfg.rounds.iter() {
+    // Each round's block is built here: the commitment depths depend on how much
+    // randomness has accumulated, which `script!` cannot compute.
+    let mut r_len = cfg.initial_folding_factor;
+    let mut rounds: Vec<Script> = Vec::new();
+    for r in cfg.rounds.iter() {
+        // While a round runs, two commitments are alive: the one it opens and
+        // the one it absorbs. The older is deeper by exactly one digest.
+        let opened = commitment_depth(r_len, merkle::DIGEST);
+        let block = script! {
             // The round commitment enters the transcript, so every challenge
-            // drawn after this point depends on it.
-            { absorb_n_from_altstack(merkle::DIGEST) }
+            // drawn after this point depends on it. It is kept, because it is
+            // what the *next* round's queries open.
+            { absorb_n_from_altstack_keep(merkle::DIGEST, r_len) }
             // Then, per out-of-domain sample, Plonky3 *alternates*: it samples
             // the point from the current rate and absorbs the answer, rather
             // than absorbing a block and sampling once. Collapsing that into one
@@ -275,14 +370,40 @@ pub fn verify(cfg: &Config) -> Script {
                 { ext4::drop_n(1) }
                 { absorb_n_from_altstack(ext4::D) }
             }
+            // The queries, against the *previous* commitment. This is where
+            // nearly all of the script weight is: one permutation per Merkle
+            // level, per query, plus the leaf hash.
+            { open_round_queries(r, opened) }
+            { drop_commitment(opened) }
             { sumcheck::sumcheck_rounds_fs_keep(r.folding_factor) }
+        };
+        rounds.push(block);
+        r_len += r.folding_factor;
+    }
+    // At the final queries the last commitment has the final polynomial stacked
+    // above it as well as the randomness.
+    let final_opened = commitment_depth(r_len, ext4::D << cfg.final_poly_vars);
+    script! {
+        // The commit phase: the initial codeword's root, and its out-of-domain
+        // samples. Round 0's queries open this one.
+        { absorb_n_from_altstack_keep(merkle::DIGEST, 0) }
+        for _ in 0..cfg.initial_ood_samples {
+            { challenger::sample_ef(0) }
+            { ext4::drop_n(1) }
+            { absorb_n_from_altstack(ext4::D) }
         }
+        { sumcheck::sumcheck_rounds_fs_keep(cfg.initial_folding_factor) }
+        for b in rounds { { b } }
 
         // The final polynomial arrives in the clear and is absorbed whole. Its
         // evaluations are extension elements, so each is `ext4::D` base ones --
         // `observe_algebra_slice`, not `observe_slice`. A copy is kept, because
         // the closing identity evaluates it.
-        { absorb_n_from_altstack_keep(ext4::D << cfg.final_poly_vars, cfg.randomness_before_final()) }
+        { absorb_n_from_altstack_keep(ext4::D << cfg.final_poly_vars, r_len) }
+        // The final proximity test opens the last round's commitment, which is
+        // still on the stack for exactly this reason.
+        { open_round_queries(&cfg.final_round, final_opened) }
+        { drop_commitment(final_opened) }
         { sumcheck::sumcheck_rounds_fs_keep(cfg.final_sumcheck_rounds) }
     }
 }
@@ -411,20 +532,26 @@ pub fn permutation_count(cfg: &Config) -> usize {
     // Indices come `RATE` per squeeze; the first batch rides the preceding
     // absorb, so only the batches after it cost a permutation.
     let index_squeezes = |queries: usize| queries.div_ceil(queries_per_squeeze()).saturating_sub(1);
+    // A leaf hash is the row absorbed `HASH_RATE` at a time -- the same
+    // `PaddingFreeSponge` the commitment was built with.
+    let leaf_hash = |row_len: usize| row_len.div_ceil(merkle::HASH_RATE);
 
-    let mut n = sumcheck_perms(cfg.initial_folding_factor);
+    // The commit phase: the initial root, and one duplexing per OOD sample.
+    let mut n = merkle::DIGEST.div_ceil(RATE) + cfg.initial_ood_samples;
+    n += sumcheck_perms(cfg.initial_folding_factor);
     for r in cfg.rounds.iter() {
         n += merkle::DIGEST.div_ceil(RATE); // the commitment
         // One duplexing per out-of-domain sample: the answer is absorbed and the
         // next point is read from the rate that absorb produced.
         n += r.ood_samples;
         n += index_squeezes(r.num_queries);
-        n += r.num_queries * r.log_domain_size; // one per Merkle level
+        n += r.num_queries * (r.log_domain_size + leaf_hash(r.row_len));
         n += sumcheck_perms(r.folding_factor);
     }
     n += (ext4::D << cfg.final_poly_vars).div_ceil(RATE);
     n += index_squeezes(cfg.final_round.num_queries);
-    n += cfg.final_round.num_queries * cfg.final_round.log_domain_size;
+    n += cfg.final_round.num_queries
+        * (cfg.final_round.log_domain_size + leaf_hash(cfg.final_round.row_len));
     n += sumcheck_perms(cfg.final_sumcheck_rounds);
     n
 }
