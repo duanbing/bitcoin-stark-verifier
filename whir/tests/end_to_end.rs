@@ -464,7 +464,7 @@ fn full_proof_verifies_as_one_script() {
     use p3_symmetric::CryptographicHasher;
     use p3_whir::pcs::proof::QueryOpenings;
     use poseidon2::merkle::{self, DIGEST};
-    use whir::{multilinear, sumcheck, verifier};
+    use whir::{challenger, multilinear, sponge, sumcheck, verifier};
 
     SECURITY_LEVEL.with(|v| *v.borrow_mut() = 1);
     RATE_LOG.with(|v| *v.borrow_mut() = 2);
@@ -491,74 +491,118 @@ fn full_proof_verifies_as_one_script() {
         .expect("opening authenticates");
     let bits: Vec<bool> = (0..depth).map(|i2| (index >> i2) & 1 == 1).collect();
 
-    // --- the real sumcheck rounds -----------------------------------------
+    // --- the real sumcheck rounds, with challenges squeezed from the sponge -
+    //
+    // The challenges are *not* supplied. Each round absorbs the prover's
+    // (h(0), h(inf)) and squeezes `r` from the resulting rate, so `r` is a
+    // function of the proof. That is the property that makes the chain mean
+    // anything: with `r` handed in, a prover picks any `c0`, solves
+    // `c_inf = (target - (1-r)c0 - r(claim-c0)) / (r(r-1))`, and reaches any
+    // claim it likes.
     let sent = &proof.whir.initial_sumcheck.polynomial_evaluations;
-    let challenges: Vec<[u32; 4]> = (0..sent.len())
-        .map(|i| ef_coeffs(EF::from_basis_coefficients_fn(|k| F::new(((i as u32 + 3) * 11 + k as u32) % 83))))
-        .collect();
+    let state0: [u32; 16] = core::array::from_fn(|i| {
+        ((i as u64 * 2_654_435_761) % poseidon2::constants::P as u64) as u32
+    });
+    let mut state = state0;
     let mut claim = ef_coeffs(EF::ONE);
     let start_claim = claim;
-    for (i, &[c0, c_inf]) in sent.iter().enumerate() {
-        claim = reference::sumcheck_round(claim, ef_coeffs(c0), ef_coeffs(c_inf), challenges[i]);
+    for &[c0, c_inf] in sent.iter() {
+        let (next, _r) =
+            reference::sumcheck_round_fs(&mut state, claim, ef_coeffs(c0), ef_coeffs(c_inf));
+        claim = next;
     }
 
-    // --- the real final polynomial ----------------------------------------
+    // --- the real final polynomial, at transcript-derived randomness -------
     let final_poly = proof.whir.final_poly.as_ref().expect("final polynomial");
     let evals: Vec<EF> = final_poly.as_slice().to_vec();
     let nv = evals.len().trailing_zeros() as usize;
+    // One squeeze per variable, mirroring the script below. Deriving them in
+    // order means the last lands on top of the altstack, which is the order
+    // `eval_multilinear` pops in.
     let point: Vec<EF> = (0..nv)
-        .map(|i| EF::from_basis_coefficients_fn(|k| F::new((5 * i as u32 + k as u32 + 2) % 79)))
+        .map(|_| {
+            let rate = reference::squeeze(&mut state);
+            EF::from_basis_coefficients_fn(|k| F::new(rate[k]))
+        })
         .collect();
     let f_at_r = ef_coeffs(final_poly.eval_ext::<F>(&Point::new(point.clone())));
 
-    // The batching weight the final check multiplies by. Chosen so the identity
-    // holds for this honest proof; a dishonest one would have to hit it exactly.
-    let weight = poseidon2::reference::ext4::mul(
-        claim,
-        poseidon2::reference::ext4::mul(f_at_r, [1, 0, 0, 0]),
-    );
-    let _ = weight;
+    // The closing identity is `claimed == weight * f(r)`. The weight here is the
+    // chained claim itself, taken from the stack rather than pushed, so the
+    // check ties the sumcheck chain to the final polynomial. `claimed` is the
+    // only hint, and it is what a tampered proof can no longer produce.
+    let claimed = poseidon2::reference::ext4::mul(claim, f_at_r);
 
     // --- one script -------------------------------------------------------
-    let verify = script! {
-        // 1. Authenticate the queried row against the commitment.
-        for x in root.iter() { {*x} }
-        for i in (0..depth).rev() { for x in sibs[i].iter() { {*x} } }
-        for x in leaf.iter() { {*x} }
-        for &b in bits.iter().rev() { { if b { 1u32 } else { 0u32 } } OP_TOALTSTACK }
-        { merkle::merkle_verify_from_altstack(depth) }
+    //
+    // `rounds` is the prover's evaluations, possibly perturbed, so the same
+    // builder serves the honest run and the tamper checks.
+    let build = |rounds: &[[EF; 2]], claimed: [u32; 4]| {
+        let rounds: Vec<[EF; 2]> = rounds.to_vec();
+        script! {
+            // 1. Authenticate the queried row against the commitment.
+            for x in root.iter() { {*x} }
+            for i in (0..depth).rev() { for x in sibs[i].iter() { {*x} } }
+            for x in leaf.iter() { {*x} }
+            for &b in bits.iter().rev() { { if b { 1u32 } else { 0u32 } } OP_TOALTSTACK }
+            { merkle::merkle_verify_from_altstack(depth) }
 
-        // 2. Re-derive the sumcheck claim from the prover's evaluations.
-        { push_ef(start_claim) }
-        for (i, &[c0, c_inf]) in sent.iter().enumerate() {
-            { push_ef(ef_coeffs(c0)) }
-            { push_ef(ef_coeffs(c_inf)) }
-            { push_ef(challenges[i]) }
-            { sumcheck::sumcheck_round() }
+            // 2. Chain the sumcheck, squeezing each challenge in script. The
+            //    altstack carries the rounds in reverse, c_inf before c0.
+            for r in rounds.iter().rev() {
+                { push_ef(ef_coeffs(r[1])) } { poseidon2::ext4::to_altstack() }
+                { push_ef(ef_coeffs(r[0])) } { poseidon2::ext4::to_altstack() }
+            }
+            { push_ef(start_claim) }
+            for s in state0 { {s} }
+            { sumcheck::sumcheck_rounds_fs(rounds.len()) }
+
+            // 3. Draw the evaluation point from the same sponge. Deriving them
+            //    in order leaves the last on top, which is the order
+            //    `eval_multilinear` pops in.
+            for _ in 0..nv {
+                { sponge::squeeze() }
+                { challenger::sample_ef(0) }
+                { poseidon2::ext4::to_altstack() }
+            }
+
+            // 4. Lift the chained claim over the state: it is the weight.
+            for _ in 0..4 { { 19 } OP_ROLL }
+
+            // 5. Closing identity, in the extension field:
+            //        claimed == claim * f(point)
+            //    `claim` is copied off the stack rather than pushed, so the
+            //    sumcheck chain and the final polynomial are tied together.
+            { push_ef(claimed) }
+            { poseidon2::ext4::copy(1) }
+            for e in evals.iter() { { push_ef(ef_coeffs(*e)) } }
+            { multilinear::eval_multilinear(nv) }
+            { verifier::final_check() }
+            OP_TRUE
         }
-        // The claim must be the value the honest transcript reaches.
-        { push_ef(claim) }
-        // Compare across the two groups, not within the pushed one: each
-        // OP_EQUALVERIFY removes two items, so the roll depth shrinks with it.
-        for i in 0..4 { { 4 - i } OP_ROLL OP_EQUALVERIFY }
-
-        // 3. Evaluate the final polynomial at the folding randomness.
-        for e in evals.iter() { { push_ef(ef_coeffs(*e)) } }
-        for x in point.iter() { { push_ef(ef_coeffs(*x)) } { poseidon2::ext4::to_altstack() } }
-        { multilinear::eval_multilinear(nv) }
-        { push_ef(f_at_r) }
-        for i in 0..4 { { 4 - i } OP_ROLL OP_EQUALVERIFY }
-
-        // 4. The closing identity, on the first coefficient.
-        { claim[0] } { f_at_r[0] } { poseidon2::reference::mul(claim[0], f_at_r[0]) }
-        OP_ROT OP_ROT
-        { verifier::final_check() }
-        OP_TRUE
     };
 
+    let verify = build(sent, claimed);
     println!("\n  composed verifier script: {} bytes", verify.len());
     let info = bitcoin_scriptexec::execute_script(verify);
     assert!(info.error.is_none(), "real proof rejected: {:?} at {:?}", info.error, info.last_opcode);
-    println!("  a real Plonky3 WHIR proof verified by one Bitcoin Script execution");
-    println!("  opening at index {index}, {} sumcheck round(s), final poly over {nv} vars\n", sent.len());
+    println!("  a real Plonky3 WHIR proof accepted by one Bitcoin Script execution");
+    println!("  opening at index {index}, {} sumcheck round(s), final poly over {nv} vars", sent.len());
+
+    // And it is a check, not a formality: perturbing any evaluation the prover
+    // sent moves the squeezed challenge, which moves the chained claim, which
+    // breaks the closing identity. Under the old design — challenges supplied
+    // as hints and `xy == xy` at the end — none of this could fail.
+    for i in 0..sent.len() {
+        for j in 0..2 {
+            let mut tampered = sent.to_vec();
+            tampered[i][j] += EF::ONE;
+            let info = bitcoin_scriptexec::execute_script(build(&tampered, claimed));
+            assert!(
+                info.error.is_some(),
+                "tampering with round {i} evaluation {j} was accepted"
+            );
+        }
+    }
+    println!("  every perturbation of the prover's evaluations is rejected\n");
 }

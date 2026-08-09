@@ -179,3 +179,114 @@ fn whir_component_sizes() {
     println!("\n  The sponge is a permutation, so it costs like one. Everything");
     println!("  else WHIR needs is under 2% of a Merkle level.\n");
 }
+
+// ---------------------------------------------------------------------------
+// Transcript-bound rounds
+// ---------------------------------------------------------------------------
+
+/// The script derives its own challenge, and lands where the reference does.
+///
+/// This is the property [`sumcheck::sumcheck_round`] cannot have: there `r` is
+/// an input, so the test can only show that two implementations agree on a
+/// number the prover chose. Here `r` is squeezed from the sponge after the
+/// round's evaluations have been absorbed, and the reference squeezes it the
+/// same way, so agreement means agreement about the *transcript*.
+#[test]
+fn fs_round_derives_its_challenge_and_matches_the_reference() {
+    let mut rng = ChaCha20Rng::seed_from_u64(11);
+    for _ in 0..8 {
+        let state0: [u32; 16] = core::array::from_fn(|_| rng.random_range(0..poseidon2::constants::P));
+        let claim = rand_ef(&mut rng);
+        let c0 = rand_ef(&mut rng);
+        let c_inf = rand_ef(&mut rng);
+
+        let mut state = state0;
+        let (want_claim, r) = reference::sumcheck_round_fs(&mut state, claim, c0, c_inf);
+        // The challenge must be a real function of what was absorbed, not a
+        // constant the test could have chosen.
+        assert_ne!(r, [0, 0, 0, 0], "challenge is degenerate");
+
+        let got = run(script! {
+            { push_ef(claim) }
+            for s in state0 { {s} }
+            { push_ef(c0) }
+            { push_ef(c_inf) }
+            { sumcheck::sumcheck_round_fs() }
+        });
+
+        // Stack is claim'(4) then state'(16), bottom to top.
+        assert_eq!(got.len(), 4 + 16, "unexpected stack shape");
+        assert_eq!(&got[0..4], &want_claim, "claim disagrees with the reference");
+        assert_eq!(&got[4..20], &state, "sponge state disagrees with the reference");
+    }
+}
+
+/// Perturbing an evaluation moves the challenge, and so moves the claim.
+///
+/// This is the whole point of binding `r`. With a supplied challenge a prover
+/// can compensate for any change to `c0` by solving for `c_inf`; once `r` is a
+/// function of both, there is nothing left to solve against.
+#[test]
+fn fs_round_challenge_responds_to_the_evaluations() {
+    let mut rng = ChaCha20Rng::seed_from_u64(12);
+    let state0: [u32; 16] = core::array::from_fn(|_| rng.random_range(0..poseidon2::constants::P));
+    let claim = rand_ef(&mut rng);
+    let c0 = rand_ef(&mut rng);
+    let c_inf = rand_ef(&mut rng);
+
+    let mut a = state0;
+    let (claim_a, r_a) = reference::sumcheck_round_fs(&mut a, claim, c0, c_inf);
+
+    // Flip one coefficient of c0 and nothing else.
+    let mut c0_bad = c0;
+    c0_bad[0] = f::add(c0_bad[0], 1);
+    let mut b = state0;
+    let (claim_b, r_b) = reference::sumcheck_round_fs(&mut b, claim, c0_bad, c_inf);
+
+    assert_ne!(r_a, r_b, "challenge did not move with the transcript");
+    assert_ne!(claim_a, claim_b, "claim did not move with the challenge");
+
+    // And the script agrees that the tampered transcript lands somewhere else.
+    let got = run(script! {
+        { push_ef(claim) }
+        for s in state0 { {s} }
+        { push_ef(c0_bad) }
+        { push_ef(c_inf) }
+        { sumcheck::sumcheck_round_fs() }
+    });
+    assert_eq!(&got[0..4], &claim_b);
+    assert_ne!(&got[0..4], &claim_a);
+}
+
+/// Rounds compose: the invariant out of one is the invariant into the next.
+#[test]
+fn fs_rounds_chain() {
+    let mut rng = ChaCha20Rng::seed_from_u64(13);
+    const N: usize = 3;
+    let state0: [u32; 16] = core::array::from_fn(|_| rng.random_range(0..poseidon2::constants::P));
+    let claim0 = rand_ef(&mut rng);
+    let evals: Vec<([u32; 4], [u32; 4])> =
+        (0..N).map(|_| (rand_ef(&mut rng), rand_ef(&mut rng))).collect();
+
+    let mut state = state0;
+    let mut claim = claim0;
+    for &(c0, c_inf) in evals.iter() {
+        let (next, _) = reference::sumcheck_round_fs(&mut state, claim, c0, c_inf);
+        claim = next;
+    }
+
+    // Altstack is LIFO, so push the rounds in reverse and, within a round,
+    // c_inf before c0 — that is the order `sumcheck_rounds_fs` documents.
+    let got = run(script! {
+        for &(c0, c_inf) in evals.iter().rev() {
+            { push_ef(c_inf) } for _ in 0..4 { OP_TOALTSTACK }
+            { push_ef(c0) }    for _ in 0..4 { OP_TOALTSTACK }
+        }
+        { push_ef(claim0) }
+        for s in state0 { {s} }
+        { sumcheck::sumcheck_rounds_fs(N) }
+    });
+    assert_eq!(got.len(), 4 + 16);
+    assert_eq!(&got[0..4], &claim, "chained claim disagrees with the reference");
+    assert_eq!(&got[4..20], &state, "chained state disagrees with the reference");
+}

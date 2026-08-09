@@ -25,6 +25,26 @@ pub fn sumcheck_round(claim: [u32; 4], c0: [u32; 4], c_inf: [u32; 4], r: [u32; 4
     extrapolate_01inf(c0, ext4::sub(claim, c0), c_inf, r)
 }
 
+/// One transcript-bound round: the mirror of [`crate::sumcheck::sumcheck_round_fs`].
+///
+/// Absorbs `c0 || c_inf` as eight base elements — coefficient 0 first, which is
+/// the order the script's picks consume them in — permutes, and reads the
+/// challenge from the first four rate slots. Returns the chained claim and the
+/// challenge that produced it, so a test can check both.
+pub fn sumcheck_round_fs(
+    state: &mut [u32; 16],
+    claim: [u32; 4],
+    c0: [u32; 4],
+    c_inf: [u32; 4],
+) -> ([u32; 4], [u32; 4]) {
+    let mut inputs = [0u32; 2 * 4];
+    inputs[..4].copy_from_slice(&c0);
+    inputs[4..].copy_from_slice(&c_inf);
+    duplexing(state, &inputs);
+    let r: [u32; 4] = state[..4].try_into().expect("rate holds four elements");
+    (sumcheck_round(claim, c0, c_inf, r), r)
+}
+
 /// `eval_multilinear_recursive` from Plonky3's `multilinear-util`.
 ///
 /// `evals` holds `2^n` values indexed big-endian by the point variables, so the
