@@ -28,6 +28,7 @@
 //! a query is a Merkle path. See `round_vs_merkle` in the tests.
 
 pub mod challenger;
+pub mod constraint;
 pub mod multilinear;
 pub mod reference;
 pub mod sponge;

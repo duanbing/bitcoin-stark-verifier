@@ -100,3 +100,21 @@ pub fn sample_bits(rate_element: u32, bits: usize) -> u32 {
     assert!((1u64 << bits) < poseidon2::constants::P as u64);
     rate_element & ((1 << bits) - 1)
 }
+
+/// `sigma' = base + sum_{i=0}^{t} gamma^(i+1) * y_i`: the mirror of
+/// [`crate::constraint::combine_answers`].
+///
+/// Written as the sum rather than as Horner, on purpose. The script uses Horner
+/// because multiplications are expensive there; the reference should state what
+/// is being computed, so that a mistake in the rearrangement shows up as a
+/// disagreement rather than being copied into both.
+pub fn combine_answers(base: [u32; 4], gamma: [u32; 4], answers: &[[u32; 4]]) -> [u32; 4] {
+    use poseidon2::reference::ext4;
+    let mut acc = base;
+    let mut power = gamma; // gamma^(i+1), starting at i = 0
+    for y in answers {
+        acc = ext4::add(acc, ext4::mul(power, *y));
+        power = ext4::mul(power, gamma);
+    }
+    acc
+}
