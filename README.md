@@ -6,15 +6,16 @@ opcode.
 | Crate | What it is |
 | --- | --- |
 | [`poseidon2`](poseidon2/) | Poseidon2 over KoalaBear — the permutation, the degree-4 extension field, row hashing and Merkle path verification |
-| [`whir`](whir/) | The WHIR verifier on top of it — Fiat–Shamir sponge, challenger, sumcheck rounds, multilinear evaluation, constraint batching and the closing identity |
+| [`whir`](whir/) | The WHIR verifier on top of it — Fiat–Shamir sponge, challenger, sumcheck rounds, multilinear evaluation, query openings, constraint batching and the closing identity |
 
 📄 **[Algorithm and implementation review](docs/whir-review.pdf)** — a formal
 account of the STIR and WHIR proximity tests, what this implementation checks,
 what it does not, and why. Source: [`docs/whir-review.tex`](docs/whir-review.tex).
 
 ```
-cargo test                              # everything, 67 tests
-cargo test -p whir --test end_to_end    # the end-to-end path
+cargo test                              # everything, 98 tests
+cargo test -p whir --test end_to_end    # a real Plonky3 proof, in script
+cargo test -p whir --test budget        # what it would cost on-chain
 ```
 
 ## Why no `OP_CAT`
@@ -30,6 +31,61 @@ field elements to a width-16 permutation — sixteen stack items passed to an
 arithmetic routine, with nothing to concatenate. It is also the hash
 [Ziren](https://github.com/ProjectZKM/Ziren) commits with.
 
+## What the verifier does
+
+`verifier::verify_and_close` emits the whole schedule and ends on the identity
+the protocol exists to reach:
+
+```
+claimed_eval == w(R) · f_M(r_fin)
+```
+
+Every value in it is derived inside the script. `R` is each round's folding
+randomness, accumulated by the sumcheck rounds rather than discarded; `w(R)` is
+the accumulated constraints evaluated at `R`; `f_M` is a copy the absorb kept of
+the final polynomial, and `r_fin` is the tail of `R`.
+
+Per round the schedule absorbs the commitment, alternates out-of-domain samples
+with their answers, opens the round's queries against the **previous** round's
+commitment, and runs its sumcheck rounds. Query indices are squeezed from the
+sponge, and the index *is* the Merkle path: the spender picks neither which leaf
+is opened nor where it sits.
+
+### What is checked
+
+- **Challenges are unchooseable.** Every one is squeezed after the values it
+  depends on are absorbed. Supplying them instead is not a shortcut but a
+  soundness error of exactly one — the review works out why.
+- **An opening is one unit.** The row is bound to its leaf by
+  `merkle::hash_row` (Plonky3's `PaddingFreeSponge`, checked against it on a row
+  from a real proof), the path recomputes the root, and that root is the
+  **absorbed commitment** rather than a value taken from the witness.
+- **The closing identity is real.** All four extension coefficients, against a
+  claim the transcript produced.
+
+- **The constraints are derived, not supplied.** Each round buries the
+  out-of-domain scalars it samples, the shift points its queries produce
+  (`domain_gen^index`) and its batching challenge below the folding randomness;
+  the closing check lifts them back out and evaluates the whole weight
+  polynomial from them. A round costs `1 + n` extension elements to carry rather
+  than `n · (1 + arity)`, because its constraints share a challenge and each
+  point is the square-power expansion of one scalar.
+
+### What is not
+
+The **statement** is supplied, and always will be: its point is public because
+it *is* the claim being proved, and a different point is a different statement
+rather than a cheaper proof of the same one.
+
+Two fidelity items remain against Plonky3. Each constraint group ends with a
+fresh squeeze for its batching challenge rather than reading whichever rate slot
+the query indices happened to leave — one permutation per round, traded for not
+coupling the challenge's position to the query count. And Plonky3 folds the
+statement and the commit phase's out-of-domain samples into one
+`initial_constraint` with a shared challenge, where this treats them as two
+groups.
+
+
 ## End to end
 
 `whir/tests/end_to_end.rs` runs [Plonky3](https://github.com/Plonky3/Plonky3)'s
@@ -38,30 +94,20 @@ verifier**, then re-derives the same claims in Bitcoin Script and executes it.
 
 The native verification comes first on purpose. Every other test compares a
 script against a Rust reference, which establishes that the two agree — not that
-either is right.
+either is right. Where a primitive exists in Plonky3, it is checked against
+Plonky3 directly: `eq_eval` against `Point::eval_eq`, `expand_univariate`
+against `Point::expand_from_univariate`, the leaf hash against
+`PaddingFreeSponge`.
 
-No hand-built vectors are involved: the evaluations are whatever the prover chose
-to send, and **the challenges are squeezed from the sponge inside the script**.
-Perturbing any evaluation moves the squeezed challenge, which moves the chained
-claim, which breaks the closing identity — asserted for every evaluation in the
-proof.
-
-**What is checked.** A query opening is one unit: the row is bound to its leaf by
-`merkle::hash_row` (Plonky3's `PaddingFreeSponge`, checked against it on a real
-row), the path recomputes the root, the row folds to an answer, and
-`constraint::combine_answers` batches the answers into the next round's target.
-`constraint::closing_check` verifies the accumulated `Σ_j w_j · f_M(z_j) = σ`.
-
-**What is not.** The accumulated `(weight, point)` pairs are not yet threaded
-between rounds, so each step is checked individually rather than as WHIR's full
-round-by-round argument. `verifier::verify` emits the part that is checked, and
-its doc comment says so. See §17 of the review.
+No hand-built vectors are involved. Perturbing any evaluation moves the squeezed
+challenge, which moves the chained claim, which breaks the closing identity —
+asserted for every evaluation in the proof.
 
 ## Measured cost
 
 Everything follows from one constant: a Poseidon2 permutation is **572,228
-bytes**, and nothing else is within 1% of it. Figures are for the test's witness
-(6 variables, width 2); each is the length of a script some test executes.
+bytes**, and nothing else is within 1% of it. Each figure below is the length of
+a script some test executes.
 
 | | bytes |
 | --- | ---: |
@@ -69,49 +115,105 @@ bytes**, and nothing else is within 1% of it. Figures are for the test's witness
 | one Merkle level | 572,252 *(24 bytes of ordering overhead)* |
 | Merkle path at depth 21 | 12,017,292 — **3.0 blocks** |
 | `sumcheck_round()` | 95,100 |
-| `eval_multilinear(5)` | 740,010 |
-| `closing_check`, per point at 4 vars | 381,988 |
-| **composed script, security 1, one query** | **8,967,342** |
+| `sumcheck_round_fs()` | 667,539 |
+| …keeping its challenge for the closing check | 667,615 — **+76 B, 0.011%** |
+| `eval_multilinear(4)` | 358,048 |
+| `eq_eval(4)` | 190,780 |
+| `constraint_eval`, 10 constraints of arity 8 | 4,053,279 |
+| …derived from scalars instead | 5,687,109 — **+40%** |
+| the whole closing check, example config | 92,801,911 — **7.5%, 0 permutations** |
+| **composed sumcheck chain, one real proof** | **8,967,342** |
 
-Binding the transcript is *cheaper* per round than hinting it, because absorbing
-is already the duplexing — Plonky3's `DuplexChallenger` permutes once when a
-`sample` follows an `observe`, where the previous schedule paid for an absorb and
-a squeeze. For the 2²⁰ example configuration `whir/tests/verifier.rs` reports:
+For the 2²⁰ example configuration — 20 queries, folding factor 4 —
+`whir/tests/verifier.rs` reports:
 
 | | permutations |
 | --- | ---: |
 | Merkle paths | 1,300 |
-| transcript | 44 |
-| **transcript share** | **3.3%** |
+| leaf hashing | 800 |
+| transcript | 62 |
+| **total** | **2,162** = 1.24 GB = **309.3 blocks** |
+| **query share** | **97.1%** |
 
-Two things dominate, and both are worth stating plainly.
+Leaf hashing is 37% of that on its own: a row at folding factor 4 is sixteen
+extension elements, so sixty-four base elements, so eight permutations per query
+on top of the twenty-one the path costs. It buys the binding — without it a
+spender could authenticate the committed leaf and fold a different row.
 
-**Merkle verification is essentially all of it.** At security 100 the cheapest
-configuration (rate 2⁻⁴) opens 26 rows against a depth-9 tree, which composes to
-roughly **135 MB**, of which Merkle work is 99.3% — three orders of magnitude
-beyond what Bitcoin will execute in one transaction, which is why BitVM2-style
-chunking exists. For contrast, a byte hash under `OP_CAT` would make one Merkle
-level about **2 bytes**. Removing the soft-fork dependency is what costs six
-orders of magnitude.
+The closing identity is **92,801,911 bytes — 7.5% of the verifier, and no
+permutation at all**, evaluating 110 constraints derived from the transcript.
+Against a supplied list it is 1.5 MB; deriving is what stops a spender choosing
+them. Arithmetic is the cheap part without being a free one.
 
-**`eval_multilinear` is exponential in the variable count**, about 23.9 KB × 2ⁿ:
-740 KB at n=5, 24 MB at n=10, 783 MB at n=15. Past roughly n=12 it overtakes
-Merkle and becomes the binding term.
+## Does it fit in a transaction?
 
-The 135 MB figure composes independent Merkle paths, because that is the
-primitive here. The proof's openings are a *pruned frontier* — 96 siblings, not
-26 × 9 — so a batched verifier sharing internal nodes would be cheaper. That
-verifier does not exist yet.
+No, and the wall is lower than a query. Taproot removed the 10,000-byte script
+limit and the 201-opcode cap, so what binds is weight: 400,000 units for a
+standard transaction, 4,000,000 for a block, witness bytes counting one each.
+
+**A standard transaction holds 0.70 of a single permutation.** One *hash* does
+not fit, let alone one query — which is 3.4 to 4.6 blocks across every
+configuration `whir/tests/budget.rs` derives.
+
+Lowering the security level does not change that. It buys **fewer queries, not
+cheaper ones**: at 16 variables a query costs the same 13.7 MB at 80 and 100
+bits, because depth is set by the domain size and not by λ. What moves is the
+total:
+
+| λ | pow | vars | permutations | blocks |
+| ---: | ---: | ---: | ---: | ---: |
+| 100 | 22 | 16 | 976 | 139.6 |
+| 80 | 22 | 16 | 740 | **105.9** |
+| 80 | 22 | 20 | 991 | 141.8 |
+| 80 | 22 | 24 | 1,249 | 178.7 |
+
+Chunking is therefore not optional, and its unit has to be *sub-query*.
+
+## Chunks
+
+The verifier is never executed on-chain. What can be is one **step** of it, if
+the prover commits to the state between steps and a challenger names the step it
+claims is wrong — so what matters is the step count and whether a step relays.
+
+A step cannot be one Merkle level (572,252 bytes against 400,000 weight units),
+so it has to be sub-permutation. That is less awkward than it sounds: a
+permutation is already a chain of rounds, each taking a state and leaving a
+state, and `permutation::rounds()` emits them with a test pinning their
+composition to `permute()`.
+
+| | |
+| --- | ---: |
+| rounds per permutation | 29 |
+| largest step | **50,126 B — 12.5% of a standard transaction** |
+| steps per standard transaction | 7 |
+| the whole verifier, 80-bit, 20 vars | 28,855 steps ≈ **4,100 chunks** |
+
+Four thousand chunks is the same order as BitVM2's own leaf count, which is the
+first evidence here that the approach is viable rather than merely smaller.
+`cargo test -p whir --test budget` prints the table for other configurations,
+and `poseidon2::disprove` holds the per-step predicate.
+
+**What the count leaves out.** There is no commitment layer — what stops a
+prover answering one challenge with one state and another with a different one
+is a one-time signature over each committed value, which needs only single-item
+hashing and so no soft fork, but is not here. And the arithmetic between
+permutations does not decompose: 2% of the verifier, which is still 25 MB with
+no step boundaries in it, and so not counted in the 4,100.
+
 
 ## Security parameters
 
-Configuration tops out at **security level 100**, not the field's ceiling. The
-first failure is at 101 with `PowBitsExceedBudget { required: 1, budget: 0 }`:
-the tests set `pow_bits: 0`, and WHIR trades query count against proof-of-work
-grinding, so the budget binds before the field does. KoalaBear gives
-log₂(p) = 30.989 and degree 4, so 123.955 bits are available. Raising `pow_bits`
-to the reference implementations' ≈22 would cut the dominant term by ~19%; §15 of
-the review works it out.
+`pow_bits: 0` is not a conservative choice; it is a configuration that mostly
+does not exist. Neither security level is derivable past a toy instance without
+grinding: 100-bit at 16 variables already requires 19 bits, 20 variables
+requires 28, and 24 requires 37. Even 80-bit needs 8 bits at 20 variables.
+KoalaBear gives log₂(p) = 30.989 and degree 4, so 123.955 bits are available and
+the field is never what binds.
+
+The soundness regime is `SecurityAssumption::CapacityBound`, the cheapest of the
+three by a factor of 3.7 in verifier hashes — here, directly, in script bytes —
+and the only one resting on the unproven half of WHIR's Conjecture 4.12. A
+verifier that settles bitcoin should say out loud which assumption it stands on.
 
 ## Credits
 
