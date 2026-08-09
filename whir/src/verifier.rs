@@ -174,12 +174,14 @@ pub fn final_check() -> Script {
 ///
 /// Two links remain outside the script, and neither is a matter of wiring:
 ///
-/// - **Query answers are not folded into the constraint.** WHIR closes a round
-///   by batching the out-of-domain answer and the `t` shift answers into the
-///   next weight polynomial and target,
-///   `w'(Z,X) = w(Z,alpha,X) + Z * sum_i gamma^(i+1) eq(z_i, X)` and
-///   `sigma' = h_k(alpha_k) + sum_i gamma^(i+1) y_i`. That needs `eq` over the
-///   extension and powers of `gamma`, neither of which this crate has yet.
+/// - **The round's answers are batched but not yet threaded through the
+///   schedule.** [`crate::constraint::combine_answers`] computes
+///   `sigma' = h_k(alpha_k) + sum_i gamma^(i+1) y_i`, and `w'` is carried
+///   symbolically until the final check collapses it into evaluations of `f_M`,
+///   which [`crate::multilinear::eval_multilinear`] already does — so no `eq`
+///   primitive is required. What remains is bookkeeping: carrying the
+///   accumulated points from round to round so the closing check knows where to
+///   evaluate.
 /// A row *is* now bound to its leaf — see [`open_query`] — so what remains is
 /// the constraint itself.
 ///
