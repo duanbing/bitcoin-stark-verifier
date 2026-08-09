@@ -119,6 +119,65 @@ pub fn combine_answers(base: [u32; 4], gamma: [u32; 4], answers: &[[u32; 4]]) ->
     acc
 }
 
+/// `eq(z, r)`: the mirror of [`crate::constraint::eq_eval`].
+///
+/// Written as the definition — a product of `z_i*r_i + (1-z_i)*(1-r_i)` — rather
+/// than as the one-multiplication rearrangement the script uses. The script is
+/// allowed to be clever because a multiplication over `EF` is sixteen base
+/// multiplications; the reference should say what is meant, so that an error in
+/// the rearrangement shows up as a disagreement instead of being copied into
+/// both.
+pub fn eq_eval(z: &[[u32; 4]], r: &[[u32; 4]]) -> [u32; 4] {
+    use poseidon2::reference::ext4;
+    assert_eq!(z.len(), r.len(), "eq is a product over matching coordinates");
+    let mut acc = EF_ONE;
+    for (&a, &b) in z.iter().zip(r) {
+        let term = ext4::add(
+            ext4::mul(a, b),
+            ext4::mul(ext4::sub(EF_ONE, a), ext4::sub(EF_ONE, b)),
+        );
+        acc = ext4::mul(acc, term);
+    }
+    acc
+}
+
+/// `expand_from_univariate`: the mirror of [`crate::constraint::expand_univariate`].
+///
+/// `[u^(2^(m-1)), ..., u^2, u]` — the multilinear point whose `eq` picks out the
+/// univariate evaluation at `u`.
+pub fn expand_univariate(u: [u32; 4], m: usize) -> Vec<[u32; 4]> {
+    use poseidon2::reference::ext4;
+    let mut out = vec![[0u32; 4]; m];
+    let mut cur = u;
+    for i in (0..m).rev() {
+        out[i] = cur;
+        cur = ext4::mul(cur, cur);
+    }
+    out
+}
+
+/// `evaluation_of_weights`: the mirror of [`crate::constraint::constraint_eval`].
+///
+/// `randomness` is the concatenation of every round's folding randomness. Each
+/// constraint reads the **last** `z.len()` coordinates of it, which is what
+/// Plonky3's `eval_constraints_poly` does by reversing, slicing to the
+/// constraint's arity, and reversing back.
+pub fn constraint_eval(
+    randomness: &[[u32; 4]],
+    groups: &[Vec<([u32; 4], Vec<[u32; 4]>)>],
+) -> [u32; 4] {
+    use poseidon2::reference::ext4;
+    let mut acc = [0u32; 4];
+    for group in groups {
+        for (w, z) in group {
+            assert!(z.len() <= randomness.len(), "constraint arity exceeds the randomness");
+            let local = &randomness[randomness.len() - z.len()..];
+            acc = ext4::add(acc, ext4::mul(*w, eq_eval(z, local)));
+        }
+    }
+    acc
+}
+
 /// `sum_j w_j * f_M(z_j)`: the mirror of [`crate::constraint::closing_check`].
 ///
 /// Returns the accumulated left-hand side, so a test can compare it with the

@@ -266,3 +266,314 @@ fn report_closing_check_size() {
     }
     println!();
 }
+
+// ---------------------------------------------------------------------------
+// Threading: eq, and the accumulated constraint polynomial
+// ---------------------------------------------------------------------------
+
+/// Load a point so `eq_eval` pops `z[n-1]` first -- the coordinate order
+/// `point_to_altstack` already uses, and the one `eval_multilinear` expects.
+fn point_coords_to_altstack(z: &[[u32; 4]]) -> bitcoin::ScriptBuf {
+    script! {
+        for c in z.iter() { { push_ef(*c) } for _ in 0..4 { OP_TOALTSTACK } }
+    }
+}
+
+/// The challenge on the stack, `r[0]` deepest.
+fn push_randomness(r: &[[u32; 4]]) -> bitcoin::ScriptBuf {
+    script! { for c in r.iter() { { push_ef(*c) } } }
+}
+
+#[test]
+fn eq_eval_matches_the_reference() {
+    let mut rng = ChaCha20Rng::seed_from_u64(47);
+    for n in 1..6usize {
+        let z: Vec<[u32; 4]> = (0..n).map(|_| rand_ef(&mut rng)).collect();
+        let r: Vec<[u32; 4]> = (0..n).map(|_| rand_ef(&mut rng)).collect();
+        let want = reference::eq_eval(&z, &r);
+
+        let got = run(script! {
+            { point_coords_to_altstack(&z) }
+            { push_randomness(&r) }
+            { constraint::eq_eval(n) }
+        });
+        // The challenge is preserved beneath the result.
+        assert_eq!(got.len(), 4 * (n + 1), "n = {n}: eq_eval disturbed the challenge");
+        assert_eq!(&got[4 * n..], want.as_slice(), "n = {n}: eq disagrees with the product");
+        assert_eq!(&got[..4 * n], r.concat().as_slice(), "n = {n}: the challenge moved");
+    }
+}
+
+/// The rearrangement is Plonky3's, so check it against Plonky3.
+///
+/// The script uses `1 + 2*z*r - z - r` and the reference uses
+/// `z*r + (1-z)*(1-r)`. Both could be a consistent misreading of what the
+/// verifier this crate targets actually computes; `Point::eval_eq` is that
+/// verifier's own routine.
+#[test]
+fn eq_eval_matches_plonky3() {
+    use p3_field::extension::BinomialExtensionField;
+    use p3_field::{BasedVectorSpace, PrimeCharacteristicRing, PrimeField32};
+    use p3_koala_bear::KoalaBear;
+    use p3_multilinear_util::point::Point;
+
+    type EF = BinomialExtensionField<KoalaBear, 4>;
+
+    let coeffs = |x: EF| -> [u32; 4] {
+        let s: &[KoalaBear] = x.as_basis_coefficients_slice();
+        core::array::from_fn(|i| s[i].as_canonical_u32())
+    };
+    let of = |c: [u32; 4]| -> EF {
+        EF::from_basis_coefficients_fn(|i| KoalaBear::from_u32(c[i]))
+    };
+
+    let mut rng = ChaCha20Rng::seed_from_u64(48);
+    for n in 1..6usize {
+        let z: Vec<[u32; 4]> = (0..n).map(|_| rand_ef(&mut rng)).collect();
+        let r: Vec<[u32; 4]> = (0..n).map(|_| rand_ef(&mut rng)).collect();
+
+        let zp: Vec<EF> = z.iter().map(|c| of(*c)).collect();
+        let rp: Vec<EF> = r.iter().map(|c| of(*c)).collect();
+        let want = coeffs(Point::eval_eq::<EF>(&zp, &rp));
+
+        assert_eq!(reference::eq_eval(&z, &r), want, "n = {n}: reference disagrees with Plonky3");
+
+        let got = run(script! {
+            { point_coords_to_altstack(&z) }
+            { push_randomness(&r) }
+            { constraint::eq_eval(n) }
+        });
+        assert_eq!(&got[4 * n..], want.as_slice(), "n = {n}: script disagrees with Plonky3");
+    }
+}
+
+/// `eq` factorises across a split, which is why threading needs no per-round work.
+///
+/// If this failed, a constraint could not simply be evaluated at a suffix of the
+/// accumulated randomness at the end -- its weight would have to be rewritten
+/// every round with the prefix folded in. The whole design of
+/// `constraint_eval` rests on this line.
+#[test]
+fn eq_factorises_across_a_split() {
+    use poseidon2::reference::ext4;
+    let mut rng = ChaCha20Rng::seed_from_u64(49);
+    for (k, m) in [(1usize, 2usize), (2, 3), (3, 1)] {
+        let z: Vec<[u32; 4]> = (0..k + m).map(|_| rand_ef(&mut rng)).collect();
+        let r: Vec<[u32; 4]> = (0..k + m).map(|_| rand_ef(&mut rng)).collect();
+        assert_eq!(
+            reference::eq_eval(&z, &r),
+            ext4::mul(
+                reference::eq_eval(&z[..k], &r[..k]),
+                reference::eq_eval(&z[k..], &r[k..]),
+            ),
+            "eq does not factorise at {k} | {m}"
+        );
+    }
+}
+
+/// A point of every arity reads its own suffix of the same randomness.
+#[test]
+fn constraint_eval_matches_the_reference() {
+    let mut rng = ChaCha20Rng::seed_from_u64(50);
+    let total = 5usize;
+    let r: Vec<[u32; 4]> = (0..total).map(|_| rand_ef(&mut rng)).collect();
+
+    // One group per round, arities shrinking the way the rounds do -- and one
+    // out of order, because nothing requires them to be sorted.
+    let shape = [(2usize, 5usize), (3, 3), (1, 4), (2, 1)];
+    let groups: Vec<Vec<([u32; 4], Vec<[u32; 4]>)>> = shape
+        .iter()
+        .map(|&(n_points, n_vars)| {
+            (0..n_points)
+                .map(|_| (rand_ef(&mut rng), (0..n_vars).map(|_| rand_ef(&mut rng)).collect()))
+                .collect()
+        })
+        .collect();
+    let want = reference::constraint_eval(&r, &groups);
+
+    let got = run(script! {
+        { groups_to_altstack(&groups) }
+        { push_randomness(&r) }
+        { constraint::constraint_eval(total, &shape) }
+    });
+    assert_eq!(got.len(), 4, "constraint_eval left the randomness behind");
+    assert_eq!(got, want.to_vec(), "the accumulated weight disagrees");
+}
+
+/// Load every group so the script pops weight then coordinates, group by group.
+fn groups_to_altstack(groups: &[Vec<([u32; 4], Vec<[u32; 4]>)>]) -> bitcoin::ScriptBuf {
+    let mut flat: Vec<([u32; 4], Vec<[u32; 4]>)> = Vec::new();
+    for g in groups {
+        flat.extend(g.iter().cloned());
+    }
+    script! {
+        for (w, z) in flat.iter().rev() { { point_to_altstack(*w, z) } }
+    }
+}
+
+/// Every carried point and weight reaches the accumulated weight.
+///
+/// A constraint that could be changed without moving the result would have been
+/// accumulated and then ignored -- the state this module exists to leave behind,
+/// one level up from `every_answer_reaches_the_target`.
+#[test]
+fn every_constraint_reaches_the_weight() {
+    let mut rng = ChaCha20Rng::seed_from_u64(51);
+    let total = 4usize;
+    let r: Vec<[u32; 4]> = (0..total).map(|_| rand_ef(&mut rng)).collect();
+    let shape = [(2usize, 4usize), (2, 2)];
+    let groups: Vec<Vec<([u32; 4], Vec<[u32; 4]>)>> = shape
+        .iter()
+        .map(|&(n_points, n_vars)| {
+            (0..n_points)
+                .map(|_| (rand_ef(&mut rng), (0..n_vars).map(|_| rand_ef(&mut rng)).collect()))
+                .collect()
+        })
+        .collect();
+
+    let eval = |gs: &[Vec<([u32; 4], Vec<[u32; 4]>)>]| {
+        run(script! {
+            { groups_to_altstack(gs) }
+            { push_randomness(&r) }
+            { constraint::constraint_eval(total, &shape) }
+        })
+    };
+    let want = eval(&groups);
+
+    for gi in 0..groups.len() {
+        for pi in 0..groups[gi].len() {
+            let mut bad = groups.to_vec();
+            bad[gi][pi].0[0] = pf::add(bad[gi][pi].0[0], 1);
+            assert_ne!(eval(&bad), want, "group {gi} point {pi}: the weight was ignored");
+
+            for c in 0..groups[gi][pi].1.len() {
+                let mut bad = groups.to_vec();
+                bad[gi][pi].1[c][0] = pf::add(bad[gi][pi].1[c][0], 1);
+                assert_ne!(eval(&bad), want, "group {gi} point {pi} coord {c}: ignored");
+            }
+        }
+    }
+}
+
+/// The randomness a constraint reads is the *suffix*, not the prefix.
+///
+/// Reading the first `n_c` coordinates instead of the last would still produce a
+/// value, agree with a reference that made the same choice, and be wrong. The
+/// two differ as soon as an arity is shorter than the total, so perturbing a
+/// coordinate that only the suffix rule reaches pins the direction.
+#[test]
+fn a_short_constraint_reads_the_end_of_the_randomness() {
+    let mut rng = ChaCha20Rng::seed_from_u64(52);
+    let total = 4usize;
+    let r: Vec<[u32; 4]> = (0..total).map(|_| rand_ef(&mut rng)).collect();
+    // One constraint over two variables: it must see r[2] and r[3] only.
+    let shape = [(1usize, 2usize)];
+    let groups = vec![vec![(rand_ef(&mut rng), vec![rand_ef(&mut rng), rand_ef(&mut rng)])]];
+
+    let eval = |r: &[[u32; 4]]| {
+        run(script! {
+            { groups_to_altstack(&groups) }
+            { push_randomness(r) }
+            { constraint::constraint_eval(total, &shape) }
+        })
+    };
+    let want = eval(&r);
+
+    for i in 0..total {
+        let mut bad = r.clone();
+        bad[i][0] = pf::add(bad[i][0], 1);
+        if i < total - 2 {
+            assert_eq!(eval(&bad), want, "r[{i}] is outside the suffix but changed the result");
+        } else {
+            assert_ne!(eval(&bad), want, "r[{i}] is in the suffix but was ignored");
+        }
+    }
+    // And the reference agrees about which coordinates matter.
+    assert_eq!(reference::constraint_eval(&r, &groups).to_vec(), want);
+}
+
+/// What threading costs, so it can be compared with the queries it constrains.
+#[test]
+fn report_constraint_eval_size() {
+    println!("\n  eq_eval(n): the accumulated weight, per constraint");
+    println!("  ------------------------------------------------");
+    for n in [1usize, 2, 4, 8, 16] {
+        println!("  n_vars = {n:>2}:  eq_eval {:>9} B", constraint::eq_eval(n).len());
+    }
+    let one = constraint::constraint_eval(8, &[(1, 8)]).len();
+    let ten = constraint::constraint_eval(8, &[(10, 8)]).len();
+    println!(
+        "  constraint_eval, 8 vars: 1 point {one} B, 10 points {ten} B, per point {} B",
+        (ten - one) / 9
+    );
+    println!();
+}
+
+/// The square-power expansion, against Plonky3's own.
+///
+/// The order matters twice over: it has to be Plonky3's, and it has to reach the
+/// altstack in the order `eq_eval` pops coordinates. Checking the value of
+/// `eq(expand(u), r)` catches a reversal that checking the coordinates alone
+/// would not, because a reversed point is still a point.
+#[test]
+fn expand_univariate_matches_plonky3() {
+    use p3_field::extension::BinomialExtensionField;
+    use p3_field::{BasedVectorSpace, PrimeCharacteristicRing, PrimeField32};
+    use p3_koala_bear::KoalaBear;
+    use p3_multilinear_util::point::Point;
+
+    type EF = BinomialExtensionField<KoalaBear, 4>;
+    let coeffs = |x: EF| -> [u32; 4] {
+        let s: &[KoalaBear] = x.as_basis_coefficients_slice();
+        core::array::from_fn(|i| s[i].as_canonical_u32())
+    };
+    let of = |c: [u32; 4]| -> EF { EF::from_basis_coefficients_fn(|i| KoalaBear::from_u32(c[i])) };
+
+    let mut rng = ChaCha20Rng::seed_from_u64(53);
+    for m in 1..6usize {
+        let u = rand_ef(&mut rng);
+        let want: Vec<[u32; 4]> =
+            Point::expand_from_univariate(of(u), m).into_iter().map(coeffs).collect();
+        assert_eq!(reference::expand_univariate(u, m), want, "m = {m}: reference expansion");
+
+        // The script leaves the point on the altstack, so read it back through
+        // the routine that consumes it.
+        let r: Vec<[u32; 4]> = (0..m).map(|_| rand_ef(&mut rng)).collect();
+        let got = run(script! {
+            { push_ef(u) }
+            { constraint::expand_univariate(m) }
+            { push_randomness(&r) }
+            { constraint::eq_eval(m) }
+        });
+        assert_eq!(
+            &got[4 * m..],
+            reference::eq_eval(&want, &r).as_slice(),
+            "m = {m}: the expansion reached eq_eval in the wrong order"
+        );
+    }
+}
+
+/// Isolate `constraint_eval_at` with values above the randomness.
+#[test]
+fn constraint_eval_at_steps_over_what_sits_above() {
+    let mut rng = ChaCha20Rng::seed_from_u64(60);
+    let total = 4usize;
+    let r: Vec<[u32; 4]> = (0..total).map(|_| rand_ef(&mut rng)).collect();
+    let shape = [(1usize, 4usize)];
+    let groups = vec![vec![(rand_ef(&mut rng), (0..4).map(|_| rand_ef(&mut rng)).collect::<Vec<_>>())]];
+    let want = reference::constraint_eval(&r, &groups);
+
+    for under in 0..3usize {
+        let above: Vec<[u32; 4]> = (0..under).map(|_| rand_ef(&mut rng)).collect();
+        let got = run(script! {
+            { groups_to_altstack(&groups) }
+            { push_randomness(&r) }
+            for x in above.iter() { { push_ef(*x) } }
+            { constraint::constraint_eval_at(total, &shape, under) }
+        });
+        assert_eq!(got.len(), 4 * (under + 1), "under = {under}: wrong stack shape");
+        assert_eq!(&got[..4 * under], above.concat().as_slice(),
+                   "under = {under}: the values above the randomness were disturbed");
+        assert_eq!(&got[4 * under..], want.as_slice(), "under = {under}: wrong weight");
+    }
+}

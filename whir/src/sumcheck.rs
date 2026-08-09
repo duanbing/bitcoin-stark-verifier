@@ -145,6 +145,87 @@ pub fn sumcheck_rounds_fs(n: usize) -> Script {
     }
 }
 
+/// [`sumcheck_round_fs`], keeping the round's challenge for the closing check.
+///
+/// # Why a round's randomness has to survive it
+///
+/// The closing identity is `claimed_eval == evaluation_of_weights * f_M(r_fin)`,
+/// and `evaluation_of_weights` is every accumulated constraint evaluated at the
+/// *concatenation of every round's folding randomness* — see
+/// [`crate::constraint::constraint_eval`]. A round that samples `r`, chains the
+/// claim with it and drops it leaves that concatenation unavailable, so the
+/// closing check has to be handed a list of points by the spender instead of
+/// deriving one. Keeping `r` is what closes that gap.
+///
+/// # Stack
+///
+/// In: `R(4j) claim(4) state(16)`, with `c0(4) c_inf(4)` pushed above.
+/// Out: `R(4j+4) claim'(4) state'(16)` — `r` appended to the accumulated
+/// randomness, which stays at the bottom with `R[0]` deepest.
+///
+/// Round order is preserved without any bookkeeping: each round appends
+/// immediately below the claim, so the block reads `alpha^(0) || alpha^(1) || ...`
+/// bottom to top, which is the order `constraint_eval` expects.
+///
+/// # Cost
+///
+/// Still one permutation. The copy is four `OP_PICK`s and the burial is twenty
+/// `OP_ROLL`s at a constant depth — under fifty bytes against 572 228 for the
+/// permutation, so threading the randomness is free at this resolution.
+pub fn sumcheck_round_fs_keep() -> Script {
+    const CLAIM_UNDER_STATE_AND_R: usize = 2 * ext4::D + sponge::WIDTH - 1;
+    const R_UNDER_THREE: usize = 4 * ext4::D - 1;
+    const STATE_UNDER_CLAIM: usize = ext4::D + sponge::WIDTH - 1;
+    // `r` under claim'(4) and state'(16), plus its own three lower slots.
+    const OVER_R: usize = 2 * ext4::D + sponge::WIDTH - 1;
+    // `r` sits three extension elements down once claim, c0 and c_inf are above.
+    const R_ELEMENTS_DOWN: usize = 3;
+
+    script! {
+        { ext4::copy(0) } { ext4::to_altstack() }
+        { ext4::copy(1) } { ext4::to_altstack() }
+
+        { sponge::absorb(2 * ext4::D) }
+        { challenger::sample_ef(0) }
+
+        for _ in 0..ext4::D { { CLAIM_UNDER_STATE_AND_R } OP_ROLL }
+        { ext4::from_altstack() }   // c0
+        { ext4::from_altstack() }   // c_inf
+
+        // Park a copy of `r` only now: before this point the altstack still
+        // holds c0 and c_inf, and a value pushed above them would be popped in
+        // their place.
+        { ext4::copy(R_ELEMENTS_DOWN) } { ext4::to_altstack() }
+
+        for _ in 0..ext4::D { { R_UNDER_THREE } OP_ROLL }
+        { sumcheck_round() }
+        for _ in 0..sponge::WIDTH { { STATE_UNDER_CLAIM } OP_ROLL }
+
+        // Bury `r` under the round's output. Lifting the claim and then the
+        // state over it, deepest slot first, preserves both orders — and both
+        // lifts read the same depth, because each roll removes one item from
+        // below and adds one above.
+        { ext4::from_altstack() }
+        for _ in 0..ext4::D { { OVER_R } OP_ROLL }
+        for _ in 0..sponge::WIDTH { { OVER_R } OP_ROLL }
+    }
+}
+
+/// `n` transcript-bound rounds that accumulate their randomness.
+///
+/// [`sumcheck_rounds_fs`] with [`sumcheck_round_fs_keep`] in place of
+/// [`sumcheck_round_fs`]; the altstack layout is identical, so a caller swapping
+/// one for the other changes nothing about how the transcript is laid out.
+pub fn sumcheck_rounds_fs_keep(n: usize) -> Script {
+    script! {
+        for _ in 0..n {
+            { ext4::from_altstack() }   // c0
+            { ext4::from_altstack() }   // c_inf
+            { sumcheck_round_fs_keep() }
+        }
+    }
+}
+
 /// `n` rounds, each taking its `c0 c_inf r` from the altstack.
 ///
 /// The claim is not known until the previous round finishes, so the proof data

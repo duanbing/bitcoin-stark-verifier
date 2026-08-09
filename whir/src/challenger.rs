@@ -24,6 +24,18 @@ pub fn sample(j: usize) -> Script {
     script! { { WIDTH - 1 - j } OP_PICK }
 }
 
+/// [`sample`] with `under` items sitting above the sponge state.
+///
+/// A query opening is the one place the state is not on top: the opening's root,
+/// siblings and row have to be on the main stack before the index can be turned
+/// into path directions, because the direction bits go on the altstack and would
+/// otherwise be popped in the opening's place. Rather than shuffle the state
+/// around the opening, the pick simply reaches further.
+pub fn sample_at(j: usize, under: usize) -> Script {
+    assert!(j < RATE);
+    script! { { WIDTH - 1 - j + under } OP_PICK }
+}
+
 /// Number of extension challenges one squeeze yields.
 pub const EF_PER_SQUEEZE: usize = RATE / 4;
 
