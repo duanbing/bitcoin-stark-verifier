@@ -181,3 +181,73 @@ fn whole_verifier_against_a_block() {
     }
     println!("\n  Query indices come {} per squeeze.\n", queries_per_squeeze());
 }
+
+/// How many chunks a BitVM2-style assertion would need.
+///
+/// The verifier is three hundred blocks and will never be executed on-chain.
+/// What can be is one *step* of it, if the prover commits to the state between
+/// steps and a challenger names the step it claims is wrong. So the number that
+/// matters is not the verifier's size but the step count, and whether a step
+/// relays.
+///
+/// A step is one Poseidon2 round, because a Merkle level is already too big:
+/// 572 252 bytes against 400 000 weight units. The rounds are what
+/// `permutation::rounds()` emits and what `rounds_compose_to_the_permutation`
+/// pins to `permute()`.
+#[test]
+fn chunk_count_for_a_disprove() {
+    let step = poseidon2::disprove::largest_round();
+    let per_perm = poseidon2::disprove::rounds_per_permutation();
+    let per_tx = STANDARD_TX_WU / step;
+
+    println!("\n  disprove chunking, one step = one Poseidon2 round");
+    println!("  ------------------------------------------------");
+    println!("  largest step               {step:>12} B  ({:.1}% of a standard tx)",
+             100.0 * step as f64 / STANDARD_TX_WU as f64);
+    println!("  steps per standard tx      {per_tx:>12}");
+    println!();
+    println!("  security  pow   vars   permutations         steps        chunks   disprove");
+    println!("  --------------------------------------------------------------------------");
+    for &security in [100usize, 80].iter() {
+        for &vars in [16usize, 20, 24].iter() {
+            let (cfg, _) = match derive(vars, security, 22) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let perms = whir::verifier::permutation_count(&cfg);
+            let steps = perms * per_perm;
+            let chunks = steps.div_ceil(per_tx);
+            println!(
+                "  {security:>3} {:>6} {vars:>6} {perms:>14} {steps:>13} {chunks:>13} {:>10} B",
+                22, step,
+            );
+        }
+    }
+    println!("\n  A disprove spends one chunk. Everything else stays off-chain unless");
+    println!("  someone cheats, which is the whole of the trick.\n");
+
+    assert!(step < STANDARD_TX_WU, "a step does not relay");
+}
+
+/// What the chunking does *not* cover, stated rather than implied.
+///
+/// The permutations decompose because `rounds()` exists. The arithmetic between
+/// them -- the sumcheck rounds, the multilinear evaluation, the constraint
+/// weights -- does not, and it is 2% of the verifier. Two per cent of 1.24 GB is
+/// still 25 MB, which is sixty standard transactions' worth of script with no
+/// step boundaries in it.
+#[test]
+fn report_unchunked_arithmetic() {
+    let (cfg, _) = derive(20, 80, 22).expect("derivable");
+    let perms = whir::verifier::permutation_count(&cfg);
+    let one = poseidon2::permutation::permute().len();
+    let hashing = perms * one;
+    // The example configuration measures its own arithmetic share; reuse it as
+    // the estimate rather than inventing a second one.
+    let arithmetic = (hashing as f64 * 0.02) as usize;
+    println!(
+        "\n  hashing {hashing} B decomposes into {} steps;\n  \
+         arithmetic is about {arithmetic} B and decomposes into none.\n",
+        perms * poseidon2::disprove::rounds_per_permutation()
+    );
+}
