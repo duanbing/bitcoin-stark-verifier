@@ -1,0 +1,177 @@
+//! Does a WHIR verifier fit in a Bitcoin transaction?
+//!
+//! Everything else in this crate measures a script. This asks the question the
+//! measurements exist to answer, against a real `WhirConfig` derived by Plonky3
+//! rather than a schedule written out by hand -- so the query counts, domain
+//! sizes and folding schedule are whatever the security analysis actually
+//! produces at a given level.
+//!
+//! Two limits bind, and neither is the one people expect. Taproot removed both
+//! the 10 000-byte script limit and the 201-opcode cap, so what is left is
+//! weight: a standard transaction is capped at 400 000 weight units, and a
+//! block at 4 000 000. Script lives in the witness at one unit per byte.
+
+use p3_challenger::DuplexChallenger;
+use p3_field::extension::BinomialExtensionField;
+use p3_koala_bear::{KoalaBear, Poseidon2KoalaBear};
+use p3_whir::parameters::{FoldingFactor, ProtocolParameters, SecurityAssumption, WhirConfig};
+use whir::verifier::{queries_per_squeeze, Config, Round};
+
+type F = KoalaBear;
+type EF = BinomialExtensionField<F, 4>;
+type Perm = Poseidon2KoalaBear<16>;
+type MyChallenger = DuplexChallenger<F, Perm, 16, 8>;
+
+/// `MAX_STANDARD_TX_WEIGHT`: what a node will relay.
+const STANDARD_TX_WU: usize = 400_000;
+/// Consensus block weight: what a miner could include directly.
+const BLOCK_WU: usize = 4_000_000;
+
+fn perm_bytes() -> usize {
+    poseidon2::permutation::permute().len()
+}
+
+/// Plonky3's derived configuration, translated into this crate's schedule.
+fn derive(
+    num_variables: usize,
+    security_level: usize,
+    pow_bits: usize,
+) -> Result<(Config, Vec<usize>), String> {
+    let folding_factor = FoldingFactor::Constant(4);
+    // One rate per round, and the recurrence is WHIR's: folding k variables
+    // multiplies the rate by 2^(1-k), so log(1/rate) grows by k-1. Writing it
+    // out by hand is what `RoundRateCountMismatch` is there to catch.
+    let schedule = folding_factor
+        .compute_folding_schedule(num_variables)
+        .expect("valid folding schedule");
+    let mut rates = Vec::with_capacity(schedule.len() - 1);
+    let mut rate = 4usize; // starting_log_inv_rate
+    for &folding in schedule.iter().take(schedule.len() - 1) {
+        rate += folding - 1;
+        rates.push(rate);
+    }
+    let params = ProtocolParameters {
+        security_level,
+        pow_bits,
+        round_log_inv_rates: rates,
+        folding_factor,
+        soundness_type: SecurityAssumption::CapacityBound,
+        starting_log_inv_rate: 4,
+    };
+    // `pow_bits: 0` is not always satisfiable: WHIR trades query count against
+    // grinding, and below a certain budget the security level is unreachable at
+    // any query count. Reporting that is more useful than asserting it away.
+    let cfg: WhirConfig<EF, F, MyChallenger> =
+        WhirConfig::new(num_variables, params).map_err(|e| format!("{e:?}"))?;
+
+    let rounds: Vec<Round> = cfg
+        .round_parameters
+        .iter()
+        .map(|r| Round {
+            folding_factor: r.folding_factor,
+            num_queries: r.num_queries,
+            log_domain_size: r.domain_size.trailing_zeros() as usize - r.folding_factor,
+            ood_samples: r.ood_samples,
+        })
+        .collect();
+    let last = cfg.round_parameters.last().expect("at least one round");
+    let final_round = Round {
+        folding_factor: 0,
+        num_queries: cfg.final_queries,
+        log_domain_size: last.domain_size.trailing_zeros() as usize - last.folding_factor,
+        ood_samples: 0,
+    };
+    let queries: Vec<usize> = cfg.round_parameters.iter().map(|r| r.num_queries).collect();
+    Ok((
+        Config {
+            initial_folding_factor: cfg.folding_schedule[0],
+            rounds,
+            final_round,
+            final_sumcheck_rounds: cfg.final_sumcheck_rounds,
+            final_poly_vars: cfg.final_sumcheck_rounds,
+        },
+        queries,
+    ))
+}
+
+/// One query is the unit that would have to be chunked, so price it alone.
+///
+/// A query is `log_domain_size` permutations for the Merkle path plus the row
+/// hash. Nothing about the security level changes that -- lowering the level
+/// buys *fewer* queries, not cheaper ones -- which is the whole point of
+/// printing both.
+#[test]
+fn one_query_against_a_transaction() {
+    let one = perm_bytes();
+    println!("\n  one Poseidon2 permutation: {one} B");
+    println!("    standard tx (400k WU) holds {:.2} permutations", STANDARD_TX_WU as f64 / one as f64);
+    println!("    whole block  (4M WU) holds {:.2} permutations", BLOCK_WU as f64 / one as f64);
+    println!("\n  security  vars   rounds  queries(r0)  depth(r0)   one query        vs block");
+    println!("  --------------------------------------------------------------------------");
+    for &security in [80usize, 100].iter() {
+        for &pow in [0usize, 22].iter() {
+            if pow >= security {
+                continue;
+            }
+            for &vars in [16usize, 20, 24].iter() {
+                let (cfg, queries) = match derive(vars, security, pow) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        println!("  {security:>3} pow{pow:<3} {vars:>4}   not derivable: {e}");
+                        continue;
+                    }
+                };
+                let depth = cfg.rounds[0].log_domain_size;
+                // The row is 2^folding_factor extension elements; the leaf hash
+                // absorbs them RATE at a time.
+                let row = 4 * (1usize << cfg.rounds[0].folding_factor);
+                let per_query = depth + row.div_ceil(8);
+                let bytes = per_query * one;
+                println!(
+                    "  {security:>3} pow{pow:<3} {vars:>4} {:>8} {:>11} {depth:>10} {:>11} B {:>9.2}",
+                    cfg.rounds.len(),
+                    queries[0],
+                    bytes,
+                    bytes as f64 / BLOCK_WU as f64,
+                );
+            }
+        }
+    }
+    println!();
+}
+
+/// The whole verifier, for the same grid.
+#[test]
+fn whole_verifier_against_a_block() {
+    let one = perm_bytes();
+    println!("\n  security  pow   vars   permutations        bytes     blocks   vs 100-bit");
+    println!("  ----------------------------------------------------------------------");
+    let mut baseline = std::collections::HashMap::new();
+    for &security in [100usize, 80].iter() {
+        for &pow in [0usize, 22].iter() {
+            if pow >= security {
+                continue;
+            }
+            for &vars in [16usize, 20, 24].iter() {
+                let (cfg, _) = match derive(vars, security, pow) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        println!("  {security:>3} {pow:>6} {vars:>6}   not derivable: {e}");
+                        continue;
+                    }
+                };
+                let n = whir::verifier::permutation_count(&cfg);
+                let bytes = n * one;
+                if security == 100 && pow == 0 {
+                    baseline.insert(vars, n);
+                }
+                let rel = baseline.get(&vars).map_or(1.0, |b| n as f64 / *b as f64);
+                println!(
+                    "  {security:>3} {pow:>6} {vars:>6} {n:>14} {bytes:>12} {:>10.1} {rel:>11.2}x",
+                    bytes as f64 / BLOCK_WU as f64,
+                );
+            }
+        }
+    }
+    println!("\n  Query indices come {} per squeeze.\n", queries_per_squeeze());
+}
