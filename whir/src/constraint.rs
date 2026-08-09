@@ -337,6 +337,88 @@ pub fn constraint_eval_at(total_vars: usize, groups: &[(usize, usize)], under: u
     }
 }
 
+/// The accumulated weight with the constraints *derived* rather than supplied.
+///
+/// [`constraint_eval`] takes a list of `(weight, point)` pairs. Both halves can
+/// be built from far less: a round's constraints are all weighted by powers of
+/// one batching challenge, and each of their points is the square-power
+/// expansion of a single scalar. So a round is described by `1 + n` extension
+/// elements — the challenge and the scalars — rather than by `n * (1 + arity)`.
+///
+/// # The weights are Horner, not a power ladder
+///
+/// Plonky3's `Constraint::challenge_powers(shift)` is
+/// `challenge.shifted_powers(challenge^shift)`, so within a constraint the
+/// weights run `chi^0, chi^1, chi^2, ...` — starting at **one**, not at `chi`.
+/// That is worth pinning down, because it differs from the `gamma^(i+1)` of the
+/// paper's `sigma'` update that [`combine_answers`] implements, and getting it
+/// wrong would produce a value that looks right and is not.
+///
+/// Starting at one means the group's contribution is a plain polynomial in
+/// `chi`, which Horner evaluates from the top:
+///
+/// ```text
+/// S := e_{n-1};   S := S*chi + e_j   for j = n-2 .. 0
+/// ```
+///
+/// `n - 1` multiplications rather than the `2n` of forming the powers.
+///
+/// # Stack
+///
+/// In: the total folding randomness `R`, `total_vars` extension elements with
+/// `R[0]` deepest.
+/// Altstack, per group in order: the batching challenge, then the scalars with
+/// the **last** popped first — the order Horner consumes them in.
+/// Out: the single scalar. `R` is consumed.
+///
+/// `groups` is `(constraints, arity)` per round.
+///
+/// # Cost
+///
+/// Per constraint: `arity - 1` multiplications to expand the point, `2 * arity`
+/// to evaluate `eq`, and one for the Horner step. No permutation anywhere — the
+/// whole of the weight polynomial is arithmetic, which is why it stays a
+/// rounding error against the query openings.
+pub fn constraint_eval_batched(total_vars: usize, groups: &[(usize, usize)]) -> Script {
+    let blocks: Vec<Script> = groups
+        .iter()
+        .map(|&(n_points, n_vars)| {
+            assert!(n_points >= 1, "a constraint group with no constraints has no challenge");
+            assert!(
+                n_vars <= total_vars,
+                "a constraint of arity {n_vars} cannot read a suffix of {total_vars} coordinates"
+            );
+            script! {
+                { ext4::from_altstack() }            // the batching challenge
+                // S := eq(expand(u_{n-1}), R)
+                { ext4::from_altstack() }
+                { expand_univariate(n_vars) }
+                { eq_eval_at(n_vars, 2) }
+                for _ in 1..n_points {
+                    // S := S * chi + eq(expand(u_j), R)
+                    { ext4::copy(1) }
+                    { ext4::mul() }
+                    { ext4::from_altstack() }
+                    { expand_univariate(n_vars) }
+                    { eq_eval_at(n_vars, 3) }
+                    { ext4::add() }
+                }
+                // Drop the challenge from under the group's total.
+                { ext4::to_altstack() }
+                { ext4::drop_n(1) }
+                { ext4::from_altstack() }
+                { ext4::add() }
+            }
+        })
+        .collect();
+    let r_slots = ext4::D * total_vars;
+    script! {
+        { ext4::push_zero() }
+        for b in blocks { { b } }
+        for j in 0..r_slots { { r_slots + ext4::D - 1 - j } OP_ROLL OP_DROP }
+    }
+}
+
 /// The closing check: `sum_j w_j * f_M(z_j) == sigma`, over `EF`.
 ///
 /// # Why this is the whole of `w'`
