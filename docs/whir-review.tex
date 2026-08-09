@@ -1,0 +1,719 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage[margin=1.05in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{listings}
+\usepackage{titlesec}
+\usepackage[hidelinks]{hyperref}
+
+\definecolor{accent}{HTML}{17547E}
+\definecolor{signal}{HTML}{A93C1C}
+\definecolor{good}{HTML}{2A6647}
+\definecolor{muted}{HTML}{5F6A78}
+\definecolor{rule}{HTML}{C2CCD8}
+\definecolor{panel}{HTML}{F1F4F8}
+
+\titleformat{\section}{\large\bfseries}{\color{accent}\thesection}{0.7em}{}
+\titleformat{\subsection}{\normalsize\bfseries}{\color{accent}\thesubsection}{0.6em}{}
+
+\lstset{
+  basicstyle=\ttfamily\scriptsize,
+  commentstyle=\color{muted},
+  breaklines=true,
+  columns=fullflexible,
+  keepspaces=true,
+  frame=single,
+  rulecolor=\color{rule},
+  backgroundcolor=\color{panel},
+  framesep=5pt,
+  xleftmargin=0pt,
+  aboveskip=1em,
+  belowskip=1em,
+  showstringspaces=false,
+}
+
+\newcommand{\defect}[2]{%
+  \par\medskip\noindent
+  {\color{signal}\rule{\linewidth}{1.2pt}}\par\vspace{-0.3em}
+  \noindent{\color{signal}\bfseries\sffamily #1}\quad{\bfseries #2}\par
+  \vspace{0.2em}\noindent{\color{rule}\rule{\linewidth}{0.4pt}}\par\vspace{0.4em}
+}
+\newcommand{\defectend}{\par\vspace{0.2em}\noindent{\color{signal}\rule{\linewidth}{1.2pt}}\par\medskip}
+
+\newcommand{\ok}{{\color{good}\textsf{\footnotesize verified}}}
+\newcommand{\fixed}{{\color{good}\textsf{\footnotesize fixed}}}
+\newcommand{\bad}[1]{{\color{signal}\textsf{\footnotesize #1}}}
+\newcommand{\warn}[1]{{\color{accent}\textsf{\footnotesize #1}}}
+
+\newcommand{\eqp}{\mathrm{eq}}
+\newcommand{\Fold}{\mathrm{Fold}}
+\newcommand{\RS}{\mathrm{RS}}
+\newcommand{\CRS}{\mathrm{CRS}}
+\newcommand{\pow}{\mathrm{pow}}
+\newcommand{\err}{\mathrm{err}}
+
+\setlength{\emergencystretch}{2.5em}
+\setlist[itemize]{itemsep=0.25em,topsep=0.35em,leftmargin=1.4em}
+\setlist[enumerate]{itemsep=0.25em,topsep=0.35em,leftmargin=1.8em}
+
+\title{\vspace{-2em}\textbf{WHIR on Bitcoin Script}\\[0.35em]
+  {\large\normalfont A formal account of the STIR and WHIR proximity tests,\\
+  and a review of \texttt{bitcoin-stark-verifier} against them}}
+\author{}
+\date{\small Subject: \texttt{AppliedPQC/bitcoin-stark-verifier}
+  \quad$\cdot$\quad Sources: ePrint 2024/390, 2024/1586
+  \quad$\cdot$\quad 67 tests passing
+  \quad$\cdot$\quad D1 / D2 / D3 fixed, query constrained}
+
+\begin{document}
+\maketitle
+\thispagestyle{empty}
+
+\begin{center}
+\begin{minipage}{0.94\linewidth}
+\small
+\noindent{\color{accent}\rule{\linewidth}{1pt}}\par\vspace{0.4em}
+\noindent\textbf{\sffamily\footnotesize SUMMARY OF FINDINGS}\par\vspace{0.5em}
+\begin{itemize}[leftmargin=1.2em]
+  \item \textbf{The primitives are sound and genuinely verified.} Poseidon2, the duplex sponge, the
+  challenger, the sumcheck round and multilinear evaluation are each checked against a Rust
+  transcription of Plonky3, with negative cases. A real Plonky3 WHIR proof's Merkle opening
+  authenticates in script, and a tampered leaf is rejected.
+  \item \textbf{Three defects sat above them}, all in the composition rather than the arithmetic:
+  Fiat--Shamir challenges were never derived (\textbf{D1}), the closing identity was a tautology
+  (\textbf{D2}), and the composed \texttt{verify()} was a cost model that was never executed
+  (\textbf{D3}). All three are fixed, with adversarial tests.
+  \item \textbf{The repair was cost-negative.} Deriving challenges in script replaced a spurious
+  second permutation per sumcheck round with a correct single one. Transcript cost fell from
+  \textbf{67 to 44} permutations (predicted $\approx$46) --- 5.0\% of total script weight down to
+  \textbf{3.3\%} --- against 1300 permutations of Merkle work, unchanged.
+  \item \textbf{The query is now constrained.} The opened row is bound to its leaf, a round's
+  answers are batched into the next target, and the closing identity checks the accumulated sum.
+  What remains is bookkeeping, not arithmetic.
+  \item \textbf{Two configuration levers remain unused}, worth roughly 20\% of script weight
+  between them: \texttt{pow\_bits = 0} where both reference implementations use $\approx$22, and
+  the choice of soundness regime, currently the conjectural one.
+\end{itemize}
+\vspace{0.3em}\noindent{\color{accent}\rule{\linewidth}{1pt}}
+\end{minipage}
+\end{center}
+
+\vspace{1em}
+
+\begin{center}{\large\bfseries Part I\quad The algorithm, formally}\end{center}
+\vspace{-0.5em}
+\noindent{\color{rule}\rule{\linewidth}{0.6pt}}
+
+\section{Setting and notation}
+
+Fix a finite field $\mathbb{F}$ with $\mathrm{char}(\mathbb{F})\neq 2$ and a \emph{smooth}
+evaluation domain $\mathcal{L}\subseteq\mathbb{F}^{*}$ --- a multiplicative coset whose order is a
+power of two. For a degree bound $d$,
+\[
+  \RS[\mathbb{F},\mathcal{L},d]
+  = \bigl\{\, f:\mathcal{L}\to\mathbb{F} \;\bigm|\; \exists\,\hat g\in\mathbb{F}^{<d}[X],\;
+    f(x)=\hat g(x)\ \forall x\in\mathcal{L} \,\bigr\},
+  \qquad \rho := d/|\mathcal{L}| .
+\]
+When $d=2^{m}$ the code has an equivalent multilinear reading, and this is the view both protocols
+use. Writing $\pow(x,m)=(x^{2^{0}},\dots,x^{2^{m-1}})$,
+\[
+  \RS[\mathbb{F},\mathcal{L},m]
+  = \bigl\{\, f \;\bigm|\; \exists\,\hat f\in\mathbb{F}^{<2}[X_{1},\dots,X_{m}],\;
+    f(x)=\hat f(\pow(x,m)) \,\bigr\}.
+\]
+$\Delta(f,g)$ is fractional Hamming distance and $\Lambda(\mathcal{C},f,\delta)$ the list. The
+equality polynomial is
+\[
+  \eqp(\boldsymbol X,\boldsymbol Y)=\prod_{i=1}^{m}\bigl(X_{i}Y_{i}+(1-X_{i})(1-Y_{i})\bigr),
+  \qquad
+  \hat f(\boldsymbol z)=\sum_{\boldsymbol b\in\{0,1\}^{m}}\hat f(\boldsymbol b)\cdot
+  \eqp(\boldsymbol b,\boldsymbol z).
+\]
+
+\section{Constrained Reed--Solomon codes}
+
+WHIR's object of study is not $\RS$ but a subcode carrying one sumcheck-shaped constraint:
+\[
+  \CRS[\mathbb{F},\mathcal{L},m,\hat w,\sigma]
+  = \Bigl\{\, f\in\RS[\mathbb{F},\mathcal{L},m] \;:\;
+  \textstyle\sum_{\boldsymbol b\in\{0,1\}^{m}}\hat w(\hat f(\boldsymbol b),\boldsymbol b)=\sigma
+  \,\Bigr\}.
+  \tag{Def.\ 1}
+\]
+The point of the definition is that a polynomial \emph{evaluation query} is a special case. Taking
+$\hat w(Z,\boldsymbol X)=Z\cdot\eqp(\boldsymbol X,\boldsymbol z)$ gives
+$\sum_{\boldsymbol b}\hat w(\hat f(\boldsymbol b),\boldsymbol b)=\hat f(\boldsymbol z)$, so
+membership with that weight \emph{is} the claim $\hat f(\boldsymbol z)=\sigma$. A proximity test for
+$\CRS$ codes is therefore simultaneously a low-degree test and a multilinear polynomial commitment
+--- which is why WHIR replaces FRI, STIR and BaseFold at once rather than sitting beside them.
+
+\section{Folding}
+
+For $\alpha\in\mathbb{F}$ and $y=x^{2}$,
+\[
+  \Fold(f,\alpha)(x^{2}) \;=\; \frac{f(x)+f(-x)}{2}
+  \;+\; \alpha\cdot\frac{f(x)-f(-x)}{2x},
+\]
+extended to $\boldsymbol\alpha$ by iteration. The structural fact is that folding is multilinear
+partial evaluation seen through the code: if $f\in\RS[\mathbb{F},\mathcal{L},m]$ then
+\[
+  \Fold(f,\boldsymbol\alpha)\in\RS[\mathbb{F},\mathcal{L}^{(2^{k})},m-k],
+  \qquad
+  \hat g(X_{k},\dots,X_{m})=\hat f(\boldsymbol\alpha,X_{k},\dots,X_{m}).
+  \tag{Claim 4.15}
+\]
+
+\section{Rate is the design variable}
+
+This is the whole idea behind both protocols, and it is a single line of arithmetic.
+
+\begin{center}\small
+\begin{tabular}{@{}lllll@{}}
+\toprule
+\textbf{Protocol} & \textbf{Degree} & \textbf{Domain} & \textbf{Rate} & $\log_{2}(1/\rho)$ per round\\
+\midrule
+FRI  & $d\to d/k$ & $|\mathcal{L}|\to|\mathcal{L}|/k$ & $\rho'=\rho$ & unchanged\\
+STIR & $d\to d/k$ & $|\mathcal{L}|\to|\mathcal{L}|/2$ & $\rho'=(2/k)\rho$ & $+\log_{2}k-1$\\
+WHIR & $m\to m-k$ & $|\mathcal{L}|\to|\mathcal{L}|/2$ & $\rho'=2^{1-k}\rho$ & $+(k-1)$\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\medskip
+\noindent\fbox{\begin{minipage}{0.96\linewidth}\small
+\textbf{A notational trap.} STIR's $k$ is the degree \emph{divisor} (a power of two, $k\ge4$);
+WHIR's $k$ is the \emph{number of variables} folded. The two agree under
+$k_{\mathrm{STIR}}=2^{\,k_{\mathrm{WHIR}}}$. The recurrence that appears in code is WHIR's.
+\end{minipage}}
+\medskip
+
+The number of queries needed in round $i$ to reach round-by-round error $2^{-\lambda}$ is
+$t_{i}=\lceil \lambda / -\log_{2}(\rho_{i}+\eta_{i})\rceil$ with
+$\rho_{i}=2^{-i(k-1)}\rho$, so $t_{i}\approx\lambda/(\log_{2}(1/\rho)+i(k-1))$. The sum over
+$M=m/k$ rounds is harmonic, not linear; using $\sum_{i=1}^{M}1/(i+c)<\log(M/c+1)+1$ (STIR
+Fact C.1),
+\[
+  q = O\!\left(\frac{\lambda}{\log(1/\rho)}
+    + \frac{\lambda}{k}\log\!\Bigl(\frac{m}{k\log(1/\rho)}\Bigr)
+    + \frac{m}{k}\right)
+  \qquad\text{versus FRI's}\quad O\!\left(\lambda+\frac{\lambda m}{k}\right).
+\]
+In the typical regime $m\le\lambda$, $\rho=O(1)$, setting $k\approx\log m$ yields $q=O(\lambda)$,
+which is optimal. \textbf{There is no further protocol-level lever on query count.}
+
+\section{A STIR iteration: quotient and degree correction}
+
+STIR sends a folded $g$ on a larger domain, pins it with an out-of-domain sample, checks it against
+$t$ shift queries, and forms the next function as a quotient:
+\[
+  \mathrm{Quotient}(f,S,\mathrm{Ans},\mathrm{Fill})(x)
+  =\frac{f(x)-\widehat{\mathrm{Ans}}(x)}{\hat V_{S}(x)}\qquad (x\notin S).
+\]
+Quotienting by a \emph{wrong} value pushes the result far from low degree (Lemma 4.4). The price is
+that the degree drops by $|\mathcal{G}|$, so the round closes with degree correction --- a geometric
+sum evaluated in $O(\log e)$ operations by repeated squaring.
+
+\section{A WHIR iteration: constraints instead of quotients}
+
+\begin{enumerate}
+  \item \textbf{Sumcheck rounds.} $k$ rounds on
+        $\sum_{\boldsymbol b}\hat w(\hat f(\boldsymbol b),\boldsymbol b)=\sigma$, giving
+        $\hat h_{1..k}$ and randomness $\boldsymbol\alpha$.
+  \item \textbf{Folded function.} The prover sends $g$ on $\mathcal{L}^{(2)}$.
+  \item \textbf{Out-of-domain sample.} $z_{0}\leftarrow\mathbb{F}$, reply $y_{0}$.
+  \item \textbf{Shift queries.} $z_{1},\dots,z_{t}\leftarrow\mathcal{L}^{(2^{k})}$, answers
+        $y_{i}=\Fold(f,\boldsymbol\alpha)(z_{i})$; then a batching challenge $\gamma$.
+  \item \textbf{Recursive claim.}
+\end{enumerate}
+\begin{align*}
+  \hat w'(Z,\boldsymbol X) &:= \hat w(Z,\boldsymbol\alpha,\boldsymbol X)
+    + Z\cdot\sum_{i=0}^{t}\gamma^{\,i+1}\cdot\eqp(\boldsymbol z_{i},\boldsymbol X),\\
+  \sigma' &:= \hat h_{k}(\alpha_{k}) + \sum_{i=0}^{t}\gamma^{\,i+1}\cdot y_{i}.
+\end{align*}
+The out-of-domain answer and the $t$ shift answers become $t+2$ additional \emph{constraints},
+folded into the weight polynomial by powers of $\gamma$. No quotient, hence no degree correction,
+hence --- as the paper states explicitly --- \textbf{the verifier performs no divisions at all}. On
+a machine without \texttt{OP\_DIV}, where an inversion must be hinted and checked, that is the
+reason this project should target WHIR rather than STIR.
+
+\section{What a shift query actually is}
+
+The most frequently occurring and most easily skimmed quantity in the protocol is
+$r^{\mathrm{shift}}_{i}$ (WHIR writes $z_{i}$). It deserves its own section, because in this
+implementation it \emph{is} ``a query'', and the identification is not obvious.
+
+\subsection*{Which domain it lives in}
+
+The first thing to get straight: a shift query is \textbf{not} drawn from the new domain
+$\mathcal{L}'$ the prover just committed to. It is drawn from
+\[
+  r^{\mathrm{shift}}_{i}\leftarrow \mathcal{L}^{(2^{k})}=\{x^{2^{k}}:x\in\mathcal{L}\},
+  \qquad |\mathcal{L}^{(2^{k})}|=|\mathcal{L}|/2^{k},
+\]
+the domain the \emph{folded} function lives on. And the folded function is \textbf{virtual} --- no
+one sends it. To read it at a point the verifier must read the original $f$ across the whole fibre:
+\[
+  y_{i}=\Fold(f,\boldsymbol\alpha)(r^{\mathrm{shift}}_{i}),
+  \qquad\text{requiring } f \text{ on } \{x: x^{2^{k}}=r^{\mathrm{shift}}_{i}\},
+  \text{ which is } 2^{k} \text{ values}.
+\]
+Those $2^{k}$ values are the paper's ``alphabet $\mathbb{F}^{2^{k}}$'' --- one query reads one
+symbol, and a symbol is $2^{k}$ field elements. In the implementation it is a Merkle \textbf{row},
+and it is exactly the row that has to be bound to its leaf.
+
+\subsection*{Why it has to exist}
+
+This is the pivot of the whole STIR/WHIR construction, and the rate reduction of Section 4 is what
+it pays for. In FRI the folded function lives \emph{naturally} on $\mathcal{L}^{(k)}$ and the
+verifier can compute it unaided. To lower the rate, STIR and WHIR have the prover re-commit a $g$ on
+a \emph{larger} new domain.
+
+But nothing forces $g$ to be $\Fold(f,\boldsymbol\alpha)$. The prover could send an unrelated
+low-degree polynomial. \textbf{The shift queries are the pin that fastens the new oracle back to the
+old one}: they require $\hat g(r^{\mathrm{shift}}_{i})=\Fold(f,\boldsymbol\alpha)(r^{\mathrm{shift}}_{i})$
+at $t$ random points. Hence the name: STIR $=$ \emph{Shift To Improve Rate}. Out-of-domain sampling
+does a different job --- it pins $g$ to a \emph{unique} codeword in the list; the shift queries then
+check that this codeword is the fold. Neither suffices alone.
+
+\subsection*{It is the soundness term}
+
+$t$ is not arbitrary; it is precisely the exponent in the query term of Section 8. The argument is
+two lines: if the codeword $u$ near $g$ disagrees with $\Fold(f,\boldsymbol\alpha)$ on at least a
+$\delta$ fraction, each uniform $r^{\mathrm{shift}}_{i}$ independently lands on a disagreement with
+probability $\ge\delta$, so
+\[
+  \Pr[\text{all } t \text{ points miss}]\le(1-\delta)^{t}
+  \;=\;\text{the leading term of }\varepsilon^{\mathrm{shift}}.
+\]
+So $t_{i}=\lceil\lambda/-\log_{2}(1-\delta_{i})\rceil$, and rate reduction saves money precisely
+because it raises the usable $\delta$ and so lowers $t$. Section 4's table and this are two sides of
+one fact.
+
+\subsection*{What it is in this implementation}
+
+\begin{center}\small
+\begin{tabular}{@{}p{5.2cm}p{8.4cm}@{}}
+\toprule
+\textbf{In the paper} & \textbf{In the script}\\
+\midrule
+sampling $r^{\mathrm{shift}}_{i}$ & \texttt{challenger::sample(slot)}, one base element from the rate\\
+its index in $\mathcal{L}^{(2^{k})}$ & \texttt{field::low\_bits\_to\_altstack} --- \textbf{these bits are the Merkle path}\\
+the $2^{k}$ values on the fibre & the opened row, bound to its leaf by \texttt{merkle::hash\_row}\\
+$y_{i}=\Fold(\cdot)(r^{\mathrm{shift}}_{i})$ & \texttt{multilinear::eval\_multilinear(k)} folds the row\\
+batching into $\sigma'$ & \texttt{constraint::combine\_answers(t)}\\
+the accumulated pairs & \texttt{constraint::closing\_check}\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The second row is worth pausing on. \textbf{The index is the path} --- the sampled bits are directly
+the direction bits of the Merkle walk, so the spender picks neither which leaf is opened nor where
+it sits; the binding is structural rather than an added check. It also explains where the
+$\mathrm{depth}$ factor in the cost law comes from:
+$\mathrm{depth}=\log_{2}|\mathcal{L}^{(2^{k})}|$, so one shift query is $\mathrm{depth}$ Poseidon2
+permutations, and that is the origin of the 1300 in Section 9.
+
+\section{Soundness, and what it rests on}
+
+Compilation through BCS requires \emph{round-by-round} soundness. WHIR's Theorem 5.2 gives:
+\begin{align*}
+  \varepsilon^{\mathrm{fold}}_{i,s} &\le \frac{d\cdot\ell_{i,s-1}}{|\mathbb{F}|}
+    + \err^{\star}(\mathcal{C},2,\delta_{i}),
+  &\varepsilon^{\mathrm{out}}_{i} &\le \frac{2^{m_{i}}\ell^{2}_{i,0}}{2|\mathbb{F}|},\\
+  \varepsilon^{\mathrm{shift}}_{i} &\le (1-\delta_{i-1})^{t_{i-1}}
+    + \frac{\ell_{i,0}(t_{i-1}+1)}{|\mathbb{F}|},
+  &\varepsilon^{\mathrm{fin}} &\le (1-\delta_{M-1})^{t_{M-1}}.
+\end{align*}
+Only $\varepsilon^{\mathrm{shift}}$ and $\varepsilon^{\mathrm{fin}}$ carry the $(1-\delta)^{t}$
+term; everything else is field-size noise.
+
+Because WHIR discards quotienting, distance preservation under folding is not enough: the analysis
+needs \emph{list} preservation, which is the paper's new tool.
+
+\medskip
+\noindent\fbox{\begin{minipage}{0.96\linewidth}\small
+\textbf{Definition 4.9 (mutual correlated agreement, informal).} $\mathsf{Gen}$ has mutual
+correlated agreement if, with high probability over $\alpha$: for \emph{every} set $S$ on which
+$\sum_{j}r_{j}f_{j}$ agrees with $\mathcal{C}$, \emph{every} $f_{i}$ agrees with $\mathcal{C}$ on
+$S$.
+\end{minipage}}
+\medskip
+
+Standard correlated agreement promises only \emph{some} set $T$; equating $S$ and $T$ upgrades
+``folding preserves distance'' to ``every codeword close to $\Fold(f,\alpha)$ is the folding of a
+codeword close to $f$'' (Theorem 4.20). It is proved in the unique-decoding regime and
+\emph{conjectured} beyond it (Conjecture 4.12).
+
+\begin{center}\small
+\begin{tabular}{@{}llcrr@{}}
+\toprule
+\textbf{Regime} & \textbf{Proximity }$\delta$ & \textbf{Status} & \textbf{Verifier hashes} & \textbf{Argument}\\
+\midrule
+WHIR-UD & $(1-\rho)/2$            & \ok                   & 10\,000 & 621 KiB\\
+WHIR-JB & $1-\sqrt{\rho}-\eta$    & \warn{Conj.\ 4.12(1)} & 5\,100 & 299 KiB\\
+WHIR-CB & $1-\rho-\eta$           & \bad{Conj.\ 4.12(2)}  & 2\,700 & 156 KiB\\
+\bottomrule
+\end{tabular}
+\end{center}
+\begin{center}\footnotesize\color{muted}
+WHIR Table 5, $m=24$, $\rho=1/2$, $\lambda=128$, Goldilocks cubic extension.
+\end{center}
+
+\clearpage
+\begin{center}{\large\bfseries Part II\quad Implementation review and repair}\end{center}
+\vspace{-0.5em}
+\noindent{\color{rule}\rule{\linewidth}{0.6pt}}
+
+\section{What the crate is, and its cost law}
+
+Two crates: \texttt{poseidon2} (the permutation, the quartic extension, Merkle verification over
+KoalaBear) and \texttt{whir} (sponge, challenger, sumcheck, multilinear evaluation, constraint,
+composed verifier). The design premise is sound and well argued --- an algebraic hash makes a digest
+eight field elements, so compressing two children is sixteen stack items handed to an arithmetic
+routine, and nothing needs concatenating. That removes the \texttt{OP\_CAT} soft-fork dependency
+entirely.
+
+Everything else follows from one measured constant: a Poseidon2 permutation is
+\textbf{572\,228 bytes} of script, and nothing else is within 1\% of it. So
+\[
+  C_{\mathrm{script}}\approx N_{\mathrm{perm}}\cdot c_{\mathrm{perm}},
+  \qquad
+  N_{\mathrm{perm}}=\underbrace{\sum_{i}t_{i}\cdot\mathrm{depth}_{i}}_{\text{Merkle}}
+  \;+\; N_{\mathrm{transcript}} .
+\]
+For the crate's example configuration the braced term is
+$20\cdot(21{+}17{+}13{+}9)+20\cdot5=\mathbf{1300}$ permutations. \textbf{Every optimisation that
+matters is an optimisation of that term.}
+
+\section{Verified, versus asserted}
+
+A test comparing a script against a Rust transcription establishes that the two \emph{agree}; only a
+test driven by a real proof, with a negative case, establishes that either is \emph{right}.
+
+\begin{center}\small
+\begin{tabular}{@{}p{4.4cm}p{3.6cm}p{3.2cm}cc@{}}
+\toprule
+\textbf{Component} & \textbf{Evidence} & \textbf{Negative case} & \textbf{Before} & \textbf{Now}\\
+\midrule
+Poseidon2, Merkle compression & vs.\ reference & --- & \ok & \ok\\
+Duplex sponge, padding & vs.\ reference & short absorb $\neq$ padded & \ok & \ok\\
+Challenger sampling & vs.\ reference & coefficient order & \ok & \ok\\
+Merkle opening of a real proof & real commitment root & tampered leaf rejected & \ok & \ok\\
+Challenge derivation & squeezed in script & perturbed evaluation rejected & \bad{D1} & \fixed\\
+Closing identity & EF identity & each coefficient rejected & \bad{D2} & \fixed\\
+Composed \texttt{verify()} & executed vs.\ reference & transcript moves the claim & \bad{D3} & \fixed\\
+Row bound to leaf & \texttt{hash\_row} vs.\ Plonky3 & every substitution rejected & \bad{gap} & \fixed\\
+Answers batched into target & vs.\ reference & every answer moves $\sigma'$ & \bad{gap} & \fixed\\
+Accumulated pairs threaded & --- & --- & \bad{gap} & \bad{open}\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{The three defects}
+
+\defect{D1}{Fiat--Shamir challenges were never derived from the transcript}
+The challenges fed to the sumcheck chain and the point at which the final polynomial was evaluated
+were deterministic constants, invented by the test rather than derived by Plonky3.
+
+Consider one round, with $h(1)$ recovered from $h(0)+h(1)=c$:
+\[
+  h(r)=(1-r)\,c_{0}+r\,(c-c_{0})+r(r-1)\,c_{\infty}.
+\]
+Fix any target $c'$ and any $r\notin\{0,1\}$. Since $r(r-1)\neq0$ is invertible,
+\[
+  c_{\infty}:=\bigl(c'-(1-r)c_{0}-r(c-c_{0})\bigr)\cdot\bigl(r(r-1)\bigr)^{-1}
+\]
+reaches $c'$ for \emph{any} $c_{0}$. Composing, a prover supplying the challenges controls the
+closing claim exactly. \textbf{The soundness error of the chain was 1.}
+
+\textbf{Fix.} \texttt{sumcheck\_round\_fs} absorbs the round's $(c_{0},c_{\infty})$ and squeezes $r$
+from the resulting rate, so $r$ is a function of the proof and is fixed only after both evaluations
+are committed. The invariant is \texttt{claim(4) || state(16)} with the sponge on top, already the
+layout \texttt{absorb} wants, so rounds compose.
+\defectend
+
+\defect{D2}{The closing identity was a tautology, in the base field}
+The test pushed $a$, $b$ and $ab$, rotated twice, and \texttt{final\_check} recomputed $ab$ to
+compare against $ab$ --- true by construction for any proof. It also compared one coefficient,
+leaving a base-field equality worth $\le\log_{2}P\approx31$ bits where the quartic extension exists
+to provide $\approx$124.
+
+\textbf{Fix.} \texttt{final\_check} multiplies in $\mathrm{EF}$ and compares all four coefficients;
+the end-to-end weight is copied off the stack rather than pushed, tying the sumcheck chain to the
+final polynomial.
+\defectend
+
+\defect{D3}{\texttt{verify()} priced a schedule it could not run}
+\texttt{sample\_ef} was never called in \texttt{src/}; \texttt{absorb} leaves a sixteen-element state
+where \texttt{sumcheck\_round} expects \texttt{claim c0 c\_inf r}; and the test only took
+\texttt{.len()}. Two bugs went with it: \texttt{open\_query} hardcoded rate slot 0, so every query in
+a round derived the \emph{same} index and opened the \emph{same} leaf; and a round absorbed two
+elements where it sends two \emph{extension} elements, then paid a second permutation for a squeeze
+that absorbing had already performed.
+
+\textbf{Fix.} Wired, executed against a reference, with the slot parameterised and the accounting
+corrected.
+\defectend
+
+\section{The repair's stack discipline}
+
+\begin{lstlisting}
+// in : claim(4) || state(16)        hints pushed above: c0(4) || c_inf(4)
+// out: claim'(4) || state'(16)
+{ ext4::copy(0) } { ext4::to_altstack() }   // park c_inf -- absorb consumes it
+{ ext4::copy(1) } { ext4::to_altstack() }   // park c0
+{ sponge::absorb(8) }                       // ONE permutation; absorb IS the duplexing
+{ challenger::sample_ef(0) }                // r := rate[0..4], bound to the transcript
+for _ in 0..4  { { 23 } OP_ROLL }           // lift claim over state'  (2*D + WIDTH - 1)
+{ ext4::from_altstack() }                   // c0
+{ ext4::from_altstack() }                   // c_inf
+for _ in 0..4  { { 15 } OP_ROLL }           // lift r to the top       (4*D - 1)
+{ sumcheck::sumcheck_round() }              // consumes claim c0 c_inf r
+for _ in 0..16 { { 19 } OP_ROLL }           // restore the invariant   (D + WIDTH - 1)
+\end{lstlisting}
+
+Each \texttt{OP\_ROLL} group lifts the deepest slot of its element first, preserving coefficient
+order.
+
+\medskip
+\noindent\fbox{\begin{minipage}{0.96\linewidth}\small
+A depth was wrong on the first attempt: \texttt{CLAIM\_UNDER\_STATE\_AND\_R} was written
+$4D+W-1=31$ where the correct value is $2D+W-1=23$. It surfaced as \texttt{InvalidStackOperation}
+--- a class of error that appears only when the script is \emph{executed}, which is itself a
+footnote to D3.
+\end{minipage}}
+
+\section{What the repair cost}
+
+Rolls and picks are one to two bytes against 572\,228 for a permutation, so the wiring is free at
+this resolution, and the round drops from two permutations to one.
+
+\begin{center}\small
+\begin{tabular}{@{}lrrrp{4.8cm}@{}}
+\toprule
+\textbf{Quantity} & \textbf{Before} & \textbf{Predicted} & \textbf{Measured} & \textbf{Why}\\
+\midrule
+Transcript permutations & 67 & $\approx$46 & \textbf{44} & absorb is the duplexing\\
+Merkle paths            & 1300 & 1300 & 1300 & the term that matters\\
+Transcript share        & 5.0\% & $\approx$3.5\% & \textbf{3.3\%} & ---\\
+Tests                   & --- & --- & \textbf{67} & all passing\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The honest verifier is smaller than the priced skeleton. \textbf{There is no efficiency argument for
+leaving Fiat--Shamir out.} The composed end-to-end script measures \textbf{8\,967\,342 bytes}: a
+real Plonky3 WHIR proof accepted by one Bitcoin Script execution, with every perturbation of the
+prover's evaluations rejected.
+
+\section{Constraining the query}
+
+Three changes, in the order they had to happen.
+
+\subsection*{The row is bound to its leaf}
+A query opening has two halves and only one used to be checked. Walking the path proves that
+\emph{some} committed leaf sits at the sampled index; with the leaf arriving as a hint alongside the
+row, nothing stopped a spender authenticating the real leaf and folding a different row.
+\texttt{merkle::hash\_row} reproduces Plonky3's \texttt{PaddingFreeSponge}: overwrite the first
+$\mathrm{RATE}$ state elements with each chunk and permute, a partial final chunk leaving the rest
+alone. No padding, no length tag --- deliberately \emph{not} the duplex, where zeroing the rest of
+the rate and binding the count is what stops a short absorb colliding with a padded longer one.
+Cost: $\lceil \mathrm{row\_len}/8\rceil$ permutations per query.
+
+\subsection*{A round's answers are batched}
+\texttt{constraint::combine\_answers} computes $\sigma'=\hat h_{k}(\alpha_{k})+\sum_{i}\gamma^{i+1}y_{i}$
+by Horner from the top --- $t+1$ multiplications rather than the $2t$ of forming the powers, the
+outer $\gamma$ being what shifts every exponent up by one. No permutation at all.
+
+\subsection*{The closing identity checks the accumulated sum}
+Each accumulated term collapses, because summing an evaluation against $\eqp$ \emph{is} evaluation:
+\[
+  \sum_{\boldsymbol b} \hat f_{M}(\boldsymbol b)\,\gamma^{e}\,\eqp(\boldsymbol z,\boldsymbol b)
+  = \gamma^{e}\,\hat f_{M}(\boldsymbol z).
+\]
+So $\hat w'$ is exactly a list of $(\text{weight},\text{point})$ pairs and checking it means
+evaluating the final polynomial at each point and taking the weighted sum. \textbf{This is why no
+$\eqp$ primitive is needed anywhere} --- $\eqp$ survives only inside something nothing touches until
+it becomes an evaluation. An earlier draft of this report assumed otherwise; reading the
+accumulation through shows it is not so, which takes the remaining work from ``build a primitive''
+down to bookkeeping.
+
+Measured, since this is where \texttt{final\_poly\_vars} bites:
+
+\begin{center}\small
+\begin{tabular}{@{}rr@{}}
+\toprule
+$n_{\mathrm{vars}}$ & bytes per point\\
+\midrule
+2 & 95{,}392\\
+3 & 190{,}922\\
+4 & 381{,}988\\
+5 & 764{,}270\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Doubling per variable. For the example configuration the accumulated pairs number roughly
+$\sum_i (t_i+2)\approx110$, so at $\texttt{final\_poly\_vars}=4$ the closing check is on the order of
+42\,MB against 743\,MB of Merkle work --- about 5\%. It is also a concrete argument for pushing
+folding work into earlier rounds: the cost is $n_{\mathrm{points}}\cdot2^{n_{\mathrm{vars}}}$.
+
+\section{Two unused levers}
+
+\subsection*{Proof of work}
+\texttt{pow\_bits: 0} is why the security level tops out at 100. Both reference implementations
+grind: STIR's benchmarks take 22 bits, reducing the soundness required from the IOP from $2^{-128}$
+to $2^{-106}$; WHIR uses $m-\log\rho-3$, also 22 at $m=24$, $\rho=1/2$. The trade is unusually
+favourable here --- a query costs $\mathrm{depth}\times572$\,KB, a proof-of-work check costs one
+permutation regardless of depth:
+\[
+  \Delta N_{\mathrm{perm}} = -\lceil20/4\rceil\cdot9 + 1 = -44 \ \text{of}\ 234
+  \;\approx\; \textbf{19\% of the dominant term}.
+\]
+
+\subsection*{Soundness regime}
+\texttt{SecurityAssumption::CapacityBound} is the cheapest of the three by a factor of 3.7 in
+verifier hashes --- here, directly, in script bytes --- and the only one resting on the unproven half
+of Conjecture 4.12. A defensible choice, and the papers' own benchmarking default, but a verifier
+that settles bitcoin should say out loud which assumption it stands on.
+
+\clearpage
+\begin{center}{\large\bfseries Part III\quad Completeness and soundness}\end{center}
+\vspace{-0.5em}
+\noindent{\color{rule}\rule{\linewidth}{0.6pt}}
+
+\medskip
+This part separates two things: the completeness and soundness of the \textbf{protocol} (the papers'
+results, stated here and explained in shape), and of \textbf{this script} (this repository's
+responsibility, covering only what it actually checks). Conflating them is the error this report has
+repeatedly pointed at.
+
+\section{Completeness}
+
+\textbf{Proposition (protocol).} If $f\in\CRS[\mathbb{F},\mathcal{L},m,\hat w,\sigma]$ and the prover
+is honest, the verifier accepts with probability \textbf{1}.
+
+\emph{Proof sketch.} Each equality is an identity in the honest case, not a probabilistic event.
+
+\begin{enumerate}
+  \item \textbf{Sumcheck.} The honest $\hat h_{\ell}(X)=\sum_{\boldsymbol b}
+  \hat w(\hat f(\boldsymbol\alpha,X,\boldsymbol b),\dots)$ makes
+  $\hat h_{1}(0)+\hat h_{1}(1)=\sigma$ and
+  $\hat h_{\ell}(0)+\hat h_{\ell}(1)=\hat h_{\ell-1}(\alpha_{\ell-1})$ hold by the definition of the
+  sum.
+  \item \textbf{Folding preserves codewords.} By Claim 4.15, $f\in\RS$ implies
+  $\Fold(f,\boldsymbol\alpha)\in\RS$ with multilinear extension $\hat f(\boldsymbol\alpha,\cdot)$, so
+  the honest $g$ is a codeword of the right degree on the right domain.
+  \item \textbf{Answers.} The honest prover sets $y_{0}=\hat g(\boldsymbol z_{0})$, and $y_{i}$ is
+  the $\Fold$ value the verifier computes from $f$ itself; the two agree by construction.
+  \item \textbf{Recursive claim.} Substituting (2) and (3) into the definitions of $\hat w'$ and
+  $\sigma'$ gives $\sum_{\boldsymbol b}\hat w'(\hat g(\boldsymbol b),\boldsymbol b)=\sigma'$, so the
+  inductive hypothesis is preserved.
+  \item \textbf{Closing.} $\hat f_{M}$ is sent in the clear and both final checks hold by
+  construction. \hfill$\square$
+\end{enumerate}
+
+\textbf{Proposition (script).} Given a proof Plonky3 accepts and a witness laid out as documented,
+the script runs to completion without aborting.
+
+\emph{Why this is measured, not argued.} \texttt{whir/tests/end\_to\_end.rs} produces a real proof
+with Plonky3's prover, confirms it with Plonky3's \emph{own} verifier, and only then hands the same
+object to the script. The order is deliberate: comparing a script against a Rust reference alone
+would let both pass while misreading a proof in the same way.
+
+\section{Soundness}
+
+\subsection*{Protocol: round by round}
+
+BCS/Fiat--Shamir needs \emph{round-by-round} soundness, not plain soundness: a state function
+$\mathsf{State}(\mathrm{tr})\in\{0,1\}$ that is 1 on the empty transcript iff the statement is true,
+that a prover cannot flip back once 0, that a verifier's next challenge flips with probability
+$\le\varepsilon_{i}$, and whose being 0 on a full transcript implies rejection. The strengthening is
+necessary because Fiat--Shamir lets a prover retry challenges, under which plain soundness does not
+survive.
+
+The four errors of Section 8 split in two, and the split is useful to an implementer:
+
+\medskip
+\noindent\fbox{\begin{minipage}{0.96\linewidth}\small
+\textbf{Field-size terms} ($\varepsilon^{\mathrm{fold}}$, $\varepsilon^{\mathrm{out}}$, and the
+second term of $\varepsilon^{\mathrm{shift}}$): of the form
+$\mathrm{poly}(2^{m},1/\rho)/|\mathbb{F}|$, shrunk by \emph{extending the field}.\\
+\textbf{Query terms} (the leading $\varepsilon^{\mathrm{shift}}$ and $\varepsilon^{\mathrm{fin}}$):
+$(1-\delta)^{t}$, shrunk only by \emph{querying more}, and on Bitcoin each query is $\mathrm{depth}$
+permutations.
+\end{minipage}}
+\medskip
+
+The whole cost structure sits on that line: field size is free (the quartic extension of KoalaBear
+gives about 124 bits), query count is the only thing that is paid for, and rate reduction exists to
+lower it.
+
+\subsection*{Script: what it actually guarantees}
+
+\begin{center}\small
+\begin{tabular}{@{}p{3.9cm}p{7.2cm}r@{}}
+\toprule
+\textbf{Property checked} & \textbf{Ground} & \textbf{Error}\\
+\midrule
+Challenges unchooseable & $r$ squeezed \emph{after} $(c_{0},c_{\infty})$ absorbed & see next\\
+One sumcheck round & false claim $\Rightarrow$ $h$ not identical; Schwartz--Zippel & $\le 3/2^{124}$\\
+Opening is committed & path recomputes the root, \texttt{OP\_EQUALVERIFY} & collision\\
+Folded row is the committed row & \texttt{hash\_row} reproduces \texttt{PaddingFreeSponge} & preimage\\
+Index unchooseable & index bits \emph{are} the path direction bits & ---\\
+Answers cannot cancel & random linear combination in powers of $\gamma$ & $\le(t{+}1)/2^{124}$\\
+Closing identity & all four EF coefficients; weight taken from the stack & $\le 1/2^{124}$\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{Not covered, and so not in that table:} threading the accumulated $(\text{weight},
+\text{point})$ pairs between rounds. Both ends exist --- $\sigma'$ is computed and the closing
+identity is checked --- but the pairs are not yet carried from round to round, so what the script
+guarantees is that each step holds individually, not WHIR's full round-by-round soundness. The gap
+between Section 8's $\varepsilon$ and this table is exactly that.
+
+\medskip
+\noindent\fbox{\begin{minipage}{0.96\linewidth}\small
+\textbf{An assumption that must be named.} The query-term errors above are under the capacity bound
+(\texttt{SecurityAssumption::CapacityBound}), which rests on the \emph{unproven} half of
+Conjecture 4.12. Under the proved unique-decoding setting the query count is 3.7$\times$ larger by
+Section 8's table, and script bytes scale with it.
+\end{minipage}}
+
+\subsection*{Why D1 was ``soundness error $=1$''}
+
+Worth isolating, because it is the line between the first row of that table holding and not. Before
+the fix $r$ came from the witness, so the prover could see $r$ before choosing
+$(c_{0},c_{\infty})$ --- or choose all three together. For any target $c'$ and any $r\notin\{0,1\}$,
+\[
+  h(r)=(1-r)c_{0}+r(c-c_{0})+r(r-1)c_{\infty}
+\]
+is an \textbf{affine} map in $c_{\infty}$ whose coefficient $r(r-1)\neq0$ is invertible, hence
+\textbf{surjective} onto $\mathrm{EF}$: pick any $c_{0}$ and solve for the unique $c_{\infty}$ that
+hits $c'$. Schwartz--Zippel does not apply --- it bounds ``fix a polynomial, then sample a random
+point'', and here the point was not random. Composing across rounds, the closing claim is entirely
+the prover's, and the chain's soundness error is 1 rather than something small. That is why the fix
+had to bind $r$ to the transcript rather than choose a better constant.
+
+\vspace{1.5em}
+\noindent{\color{rule}\rule{\linewidth}{0.6pt}}
+\par\vspace{0.5em}
+\noindent\footnotesize\color{muted}
+Sources: G.~Arnon, A.~Chiesa, G.~Fenzi, E.~Yogev, \emph{STIR: Reed--Solomon Proximity Testing with
+Fewer Queries}, ePrint 2024/390 (CRYPTO~'24); and \emph{WHIR: Reed--Solomon Proximity Testing with
+Super-Fast Verification}, ePrint 2024/1586. Implementation figures are from
+\texttt{poseidon2/tests/verifier\_cost.rs}, \texttt{whir/tests/end\_to\_end.rs},
+\texttt{whir/tests/verifier.rs} and \texttt{whir/tests/constraint.rs}. The 44 transcript
+permutations, 3.3\% share, 8\,967\,342-byte composed script, per-point closing-check sizes and 67
+passing tests are all measured on this machine; the 135\,MB and \texttt{eval\_multilinear}
+extrapolations follow the repository README.
+
+\end{document}
