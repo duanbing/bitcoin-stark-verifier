@@ -582,11 +582,12 @@ fn constraint_eval_at_steps_over_what_sits_above() {
 // Deriving the constraints instead of being handed them
 // ---------------------------------------------------------------------------
 
-/// One group: the challenge, then the scalars with the last popped first.
+/// One group: the scalars in order, then the challenge -- the order a round
+/// samples them in, and so the order it can bury them in.
 fn batched_group_to_altstack(chi: [u32; 4], scalars: &[[u32; 4]]) -> bitcoin::ScriptBuf {
     script! {
-        for u in scalars.iter() { { push_ef(*u) } for _ in 0..4 { OP_TOALTSTACK } }
         { push_ef(chi) } for _ in 0..4 { OP_TOALTSTACK }
+        for u in scalars.iter().rev() { { push_ef(*u) } for _ in 0..4 { OP_TOALTSTACK } }
     }
 }
 
@@ -712,4 +713,35 @@ fn report_batched_size() {
         );
     }
     println!();
+}
+
+/// The batched form with values above the randomness, as `close` calls it.
+#[test]
+fn batched_steps_over_what_sits_above() {
+    let mut rng = ChaCha20Rng::seed_from_u64(64);
+    let total = 4usize;
+    let r: Vec<[u32; 4]> = (0..total).map(|_| rand_ef(&mut rng)).collect();
+    let shape = [(2usize, 4usize), (3, 2)];
+    let groups: Vec<([u32; 4], Vec<[u32; 4]>, usize)> = shape
+        .iter()
+        .map(|&(n, arity)| {
+            (rand_ef(&mut rng), (0..n).map(|_| rand_ef(&mut rng)).collect(), arity)
+        })
+        .collect();
+    let want = reference::constraint_eval_batched(&r, &groups);
+    let shape_pairs: Vec<(usize, usize)> = shape.to_vec();
+
+    for under in 0..3usize {
+        let above: Vec<[u32; 4]> = (0..under).map(|_| rand_ef(&mut rng)).collect();
+        let got = run(script! {
+            { batched_groups_to_altstack(&groups) }
+            { push_randomness(&r) }
+            for x in above.iter() { { push_ef(*x) } }
+            { constraint::constraint_eval_batched_at(total, &shape_pairs, under) }
+        });
+        assert_eq!(got.len(), 4 * (under + 1), "under = {under}: wrong stack shape");
+        assert_eq!(&got[..4 * under], above.concat().as_slice(),
+                   "under = {under}: the values above the randomness were disturbed");
+        assert_eq!(&got[4 * under..], want.as_slice(), "under = {under}: wrong weight");
+    }
 }
