@@ -290,3 +290,86 @@ fn fs_rounds_chain() {
     assert_eq!(&got[0..4], &claim, "chained claim disagrees with the reference");
     assert_eq!(&got[4..20], &state, "chained state disagrees with the reference");
 }
+
+/// The kept randomness is every round's challenge, in round order.
+///
+/// `constraint_eval` reads a constraint's local point as a *suffix* of this
+/// block, so both the values and their order have to be right — a reversed
+/// accumulation would still produce a plausible-looking stack.
+#[test]
+fn fs_rounds_keep_their_randomness() {
+    let mut rng = ChaCha20Rng::seed_from_u64(14);
+    const N: usize = 4;
+    let state0: [u32; 16] = core::array::from_fn(|_| rng.random_range(0..poseidon2::constants::P));
+    let claim0 = rand_ef(&mut rng);
+    let evals: Vec<([u32; 4], [u32; 4])> =
+        (0..N).map(|_| (rand_ef(&mut rng), rand_ef(&mut rng))).collect();
+
+    let mut state = state0;
+    let mut claim = claim0;
+    let mut randomness: Vec<[u32; 4]> = Vec::new();
+    for &(c0, c_inf) in evals.iter() {
+        let (next, r) = reference::sumcheck_round_fs(&mut state, claim, c0, c_inf);
+        claim = next;
+        randomness.push(r);
+    }
+
+    let got = run(script! {
+        for &(c0, c_inf) in evals.iter().rev() {
+            { push_ef(c_inf) } for _ in 0..4 { OP_TOALTSTACK }
+            { push_ef(c0) }    for _ in 0..4 { OP_TOALTSTACK }
+        }
+        { push_ef(claim0) }
+        for s in state0 { {s} }
+        { sumcheck::sumcheck_rounds_fs_keep(N) }
+    });
+
+    assert_eq!(got.len(), 4 * N + 4 + 16, "the randomness block is the wrong size");
+    assert_eq!(&got[..4 * N], randomness.concat().as_slice(),
+               "the accumulated randomness is wrong, or in the wrong order");
+    // The invariant the rounds compose on is untouched underneath it all.
+    assert_eq!(&got[4 * N..4 * N + 4], &claim, "keeping r disturbed the chained claim");
+    assert_eq!(&got[4 * N + 4..], &state, "keeping r disturbed the sponge state");
+}
+
+/// Keeping the randomness changes nothing else.
+///
+/// The two variants must agree on the claim and the state for one to be a drop-in
+/// for the other in `verifier::verify`.
+#[test]
+fn keeping_the_randomness_agrees_with_dropping_it() {
+    let mut rng = ChaCha20Rng::seed_from_u64(15);
+    const N: usize = 3;
+    let state0: [u32; 16] = core::array::from_fn(|_| rng.random_range(0..poseidon2::constants::P));
+    let claim0 = rand_ef(&mut rng);
+    let evals: Vec<([u32; 4], [u32; 4])> =
+        (0..N).map(|_| (rand_ef(&mut rng), rand_ef(&mut rng))).collect();
+
+    let with = |keep: bool| {
+        run(script! {
+            for &(c0, c_inf) in evals.iter().rev() {
+                { push_ef(c_inf) } for _ in 0..4 { OP_TOALTSTACK }
+                { push_ef(c0) }    for _ in 0..4 { OP_TOALTSTACK }
+            }
+            { push_ef(claim0) }
+            for s in state0 { {s} }
+            if keep { { sumcheck::sumcheck_rounds_fs_keep(N) } }
+            else    { { sumcheck::sumcheck_rounds_fs(N) } }
+        })
+    };
+    let kept = with(true);
+    let dropped = with(false);
+    assert_eq!(&kept[4 * N..], dropped.as_slice(), "the variants disagree above the randomness");
+}
+
+/// What keeping the randomness costs.
+#[test]
+fn report_keep_overhead() {
+    let plain = sumcheck::sumcheck_round_fs().len();
+    let keep = sumcheck::sumcheck_round_fs_keep().len();
+    println!(
+        "\n  sumcheck_round_fs {plain} B, _keep {keep} B, overhead {} B ({:.4}% of a round)\n",
+        keep - plain,
+        100.0 * (keep - plain) as f64 / plain as f64
+    );
+}

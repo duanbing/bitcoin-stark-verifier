@@ -125,6 +125,14 @@ fn small() -> Config {
 }
 
 /// The transcript that `verify` consumes, and the state and claim it should
+/// The coordinates of folding randomness a schedule produces: one per sumcheck
+/// round, which is what `sumcheck_rounds_fs_keep` leaves on the stack.
+fn total_folding_vars(cfg: &Config) -> usize {
+    cfg.initial_folding_factor
+        + cfg.rounds.iter().map(|r| r.folding_factor).sum::<usize>()
+        + cfg.final_sumcheck_rounds
+}
+
 /// reach. Mirrors the script step for step in plain Rust.
 struct Spine {
     items: Vec<u32>,
@@ -137,7 +145,7 @@ fn build_spine(cfg: &Config, rng: &mut ChaCha20Rng, state0: [u32; 16], claim0: [
     let mut state = state0;
     let mut claim = claim0;
 
-    let mut sumcheck = |n: usize, items: &mut Vec<u32>, state: &mut [u32; 16], claim: &mut [u32; 4], rng: &mut ChaCha20Rng| {
+    let sumcheck = |n: usize, items: &mut Vec<u32>, state: &mut [u32; 16], claim: &mut [u32; 4], rng: &mut ChaCha20Rng| {
         for _ in 0..n {
             let (c0, c_inf) = (rand_ef(rng), rand_ef(rng));
             items.extend_from_slice(&c0);
@@ -146,7 +154,7 @@ fn build_spine(cfg: &Config, rng: &mut ChaCha20Rng, state0: [u32; 16], claim0: [
             *claim = next;
         }
     };
-    let mut absorb = |n: usize, items: &mut Vec<u32>, state: &mut [u32; 16], rng: &mut ChaCha20Rng| {
+    let absorb = |n: usize, items: &mut Vec<u32>, state: &mut [u32; 16], rng: &mut ChaCha20Rng| {
         let vals: Vec<u32> = (0..n).map(|_| rand_f(rng)).collect();
         items.extend_from_slice(&vals);
         for block in vals.chunks(reference::RATE) {
@@ -156,10 +164,16 @@ fn build_spine(cfg: &Config, rng: &mut ChaCha20Rng, state0: [u32; 16], claim0: [
 
     sumcheck(cfg.initial_folding_factor, &mut items, &mut state, &mut claim, rng);
     for r in cfg.rounds.iter() {
-        absorb(poseidon2::merkle::DIGEST + r.ood_samples, &mut items, &mut state, rng);
+        absorb(poseidon2::merkle::DIGEST, &mut items, &mut state, rng);
+        // The point is sampled from the rate the previous absorb produced, and
+        // only then is the answer absorbed. Sampling reads the state without
+        // permuting, so the mirror has nothing to do but keep the order.
+        for _ in 0..r.ood_samples {
+            absorb(4, &mut items, &mut state, rng);
+        }
         sumcheck(r.folding_factor, &mut items, &mut state, &mut claim, rng);
     }
-    absorb(1 << cfg.final_poly_vars, &mut items, &mut state, rng);
+    absorb(4 << cfg.final_poly_vars, &mut items, &mut state, rng);
     sumcheck(cfg.final_sumcheck_rounds, &mut items, &mut state, &mut claim, rng);
 
     Spine { items, claim, state }
@@ -187,9 +201,10 @@ fn transcript_spine_executes_and_matches_the_reference() {
         { verifier::verify(&cfg) }
     });
 
-    assert_eq!(got.len(), 4 + 16, "unexpected stack shape");
-    assert_eq!(&got[0..4], &want.claim, "claim disagrees with the reference");
-    assert_eq!(&got[4..20], &want.state, "sponge state disagrees with the reference");
+    let m = total_folding_vars(&cfg);
+    assert_eq!(got.len(), 4 * m + 4 + 16, "unexpected stack shape");
+    assert_eq!(&got[4 * m..4 * m + 4], &want.claim, "claim disagrees with the reference");
+    assert_eq!(&got[4 * m + 4..], &want.state, "sponge state disagrees with the reference");
 }
 
 /// Changing one byte of the transcript changes the claim the spine reaches.
@@ -218,8 +233,9 @@ fn transcript_spine_is_sensitive_to_every_absorbed_value() {
             for s in state0 { {s} }
             { verifier::verify(&cfg) }
         });
+        let m = total_folding_vars(&cfg);
         assert_ne!(
-            &got[0..4],
+            &got[4 * m..4 * m + 4],
             &want.claim,
             "perturbing transcript position {i} left the claim unchanged"
         );
@@ -243,9 +259,9 @@ fn permutation_count_agrees_with_the_emitted_spine() {
     let absorbs: usize = cfg
         .rounds
         .iter()
-        .map(|r| (poseidon2::merkle::DIGEST + r.ood_samples).div_ceil(reference::RATE))
+        .map(|r| poseidon2::merkle::DIGEST.div_ceil(reference::RATE) + r.ood_samples)
         .sum::<usize>()
-        + (1usize << cfg.final_poly_vars).div_ceil(reference::RATE);
+        + (4usize << cfg.final_poly_vars).div_ceil(reference::RATE);
 
     assert_eq!(
         spine_perms,

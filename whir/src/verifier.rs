@@ -168,19 +168,24 @@ pub fn final_check() -> Script {
 /// In: `claim(4) state(16)` on the main stack, with the transcript on the
 /// altstack in consumption order — for each sumcheck round `c_inf` then `c0`,
 /// and each absorbed block in the order it is read.
-/// Out: `claim(4) state(16)`, the chained claim and the final sponge state.
+/// Out: `R(4m) claim(4) state(16)`, where `R` is every round's folding
+/// randomness concatenated in round order — the point the accumulated
+/// constraints are evaluated at.
 ///
 /// # What this does not cover
 ///
 /// Two links remain outside the script, and neither is a matter of wiring:
 ///
-/// - **The accumulated points are not threaded through the rounds.**
-///   [`crate::constraint::combine_answers`] computes each round's `sigma'` and
-///   [`crate::constraint::closing_check`] verifies the closing identity given
-///   the accumulated `(weight, point)` pairs, so both ends exist. What is
-///   missing is the bookkeeping between them: carrying the pairs from round to
-///   round, with the folding randomness substituted, so the closing check is
-///   handed the right list.
+/// - **The closing identity is not emitted here.** Every input it needs now
+///   exists: the folding randomness is accumulated on the stack by
+///   [`sumcheck::sumcheck_rounds_fs_keep`],
+///   [`crate::constraint::expand_univariate`] turns a sampled scalar into a
+///   constraint point and [`crate::constraint::constraint_eval`] evaluates the
+///   accumulated constraints against the randomness, which is what
+///   [`final_check`] multiplies against the final polynomial. What this function
+///   does not do is choose the witness layout for the constraint weights, so it
+///   stops at the transcript and leaves `R` on the stack for a caller to close
+///   over.
 ///
 /// So this is the part of the verifier that is *checked*, not the whole
 /// verifier. [`permutation_count`] prices the whole schedule including queries;
@@ -188,19 +193,30 @@ pub fn final_check() -> Script {
 /// which it is.
 pub fn verify(cfg: &Config) -> Script {
     script! {
-        { sumcheck::sumcheck_rounds_fs(cfg.initial_folding_factor) }
+        { sumcheck::sumcheck_rounds_fs_keep(cfg.initial_folding_factor) }
 
         for r in cfg.rounds.iter() {
-            // The round commitment and its out-of-domain answers enter the
-            // transcript, so every challenge drawn after this point depends on
-            // them.
-            { absorb_n_from_altstack(merkle::DIGEST + r.ood_samples) }
-            { sumcheck::sumcheck_rounds_fs(r.folding_factor) }
+            // The round commitment enters the transcript, so every challenge
+            // drawn after this point depends on it.
+            { absorb_n_from_altstack(merkle::DIGEST) }
+            // Then, per out-of-domain sample, Plonky3 *alternates*: it samples
+            // the point from the current rate and absorbs the answer, rather
+            // than absorbing a block and sampling once. Collapsing that into one
+            // absorb gets both the permutation count and the challenges wrong,
+            // because a point sampled after the answers depends on them.
+            for _ in 0..r.ood_samples {
+                { challenger::sample_ef(0) }
+                { ext4::drop_n(1) }
+                { absorb_n_from_altstack(ext4::D) }
+            }
+            { sumcheck::sumcheck_rounds_fs_keep(r.folding_factor) }
         }
 
-        // The final polynomial arrives in the clear and is absorbed whole.
-        { absorb_n_from_altstack(1 << cfg.final_poly_vars) }
-        { sumcheck::sumcheck_rounds_fs(cfg.final_sumcheck_rounds) }
+        // The final polynomial arrives in the clear and is absorbed whole. Its
+        // evaluations are extension elements, so each is `ext4::D` base ones --
+        // `observe_algebra_slice`, not `observe_slice`.
+        { absorb_n_from_altstack(ext4::D << cfg.final_poly_vars) }
+        { sumcheck::sumcheck_rounds_fs_keep(cfg.final_sumcheck_rounds) }
     }
 }
 
@@ -210,16 +226,19 @@ pub fn verify(cfg: &Config) -> Script {
 /// Script weight is very nearly this number times the permutation size, because
 /// nothing else is within 1% of one.
 ///
-/// Two corrections against the previous accounting, both of which made the
-/// schedule look more expensive than an honest verifier is:
+/// Corrections against the original accounting, in both directions:
 ///
 /// - a sumcheck round is **one** permutation, not two — the absorb *is* the
 ///   duplexing, and the extra squeeze was never needed;
 /// - a round absorbs two *extension* elements, so eight base elements, which
-///   still fits one rate block.
-///
-/// One addition, which the previous accounting missed: query indices are drawn
-/// `RATE` at a time, so a round with more queries than that has to re-squeeze.
+///   still fits one rate block;
+/// - query indices are drawn `RATE` at a time, so a round with more queries than
+///   that has to re-squeeze;
+/// - out-of-domain answers and the final polynomial are **extension** elements.
+///   Counting them as base elements under-absorbed by a factor of four, and the
+///   out-of-domain points are sampled one at a time between the answers rather
+///   than once after them, which is one duplexing per sample and not one per
+///   rate block.
 pub fn permutation_count(cfg: &Config) -> usize {
     // Absorb-and-sample is a single duplexing.
     let sumcheck_perms = |rounds: usize| rounds;
@@ -229,12 +248,15 @@ pub fn permutation_count(cfg: &Config) -> usize {
 
     let mut n = sumcheck_perms(cfg.initial_folding_factor);
     for r in cfg.rounds.iter() {
-        n += (merkle::DIGEST + r.ood_samples).div_ceil(RATE); // commitment + OOD
+        n += merkle::DIGEST.div_ceil(RATE); // the commitment
+        // One duplexing per out-of-domain sample: the answer is absorbed and the
+        // next point is read from the rate that absorb produced.
+        n += r.ood_samples;
         n += index_squeezes(r.num_queries);
         n += r.num_queries * r.log_domain_size; // one per Merkle level
         n += sumcheck_perms(r.folding_factor);
     }
-    n += (1usize << cfg.final_poly_vars).div_ceil(RATE);
+    n += (ext4::D << cfg.final_poly_vars).div_ceil(RATE);
     n += index_squeezes(cfg.final_round.num_queries);
     n += cfg.final_round.num_queries * cfg.final_round.log_domain_size;
     n += sumcheck_perms(cfg.final_sumcheck_rounds);

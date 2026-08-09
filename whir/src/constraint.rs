@@ -9,18 +9,61 @@
 //! ```
 //!
 //! The two halves are not equally hard. `sigma'` is plain extension-field
-//! arithmetic on values the verifier already holds, and that is what this module
-//! computes. `w'` is carried *symbolically* — it is never evaluated during a
-//! round — and when the final check does evaluate it, each accumulated term is
-//! `f_M` at a point, which [`crate::multilinear::eval_multilinear`] already does.
-//! So no `eq` primitive is needed anywhere, which is not obvious from the
-//! formula and is worth stating: the `eq` factors survive only inside a
-//! polynomial the verifier never touches until it collapses into an evaluation.
+//! arithmetic on values the verifier already holds, and that is what
+//! [`combine_answers`] computes. `w'` is carried *symbolically* — it is never
+//! evaluated during a round — and the question is what happens to it at the end.
 //!
-//! Together with the row-to-leaf binding in [`poseidon2::merkle::hash_row`],
-//! this is what makes a query *constrain* something. Before, an answer was
-//! authenticated against the commitment and then dropped; now it reaches the
-//! claim the next round is about.
+//! # Two readings of the closing identity, and which one Plonky3 uses
+//!
+//! The paper's reading folds the weight against the polynomial's evaluations:
+//!
+//! ```text
+//! sum_b f_M(b) * gamma^e * eq(z, b)  =  gamma^e * f_M(z)
+//! ```
+//!
+//! so each accumulated term collapses into an evaluation of `f_M` and no `eq`
+//! is ever computed. That is what [`closing_check`] does, and an earlier version
+//! of this module claimed it was the whole story.
+//!
+//! It is not the shape Plonky3's verifier has. There, `w` and `f_M` are kept
+//! apart and each is evaluated at its own point:
+//!
+//! ```text
+//! claimed_eval == evaluation_of_weights * final_value
+//!     evaluation_of_weights = eval_constraints_poly(&constraints, &folding_randomness)
+//!     final_value           = final_evaluations.eval_ext(&final_sumcheck_randomness)
+//! ```
+//!
+//! and `eval_constraints_poly` evaluates every accumulated `eq(z, .)` explicitly.
+//! Since this crate is checked against Plonky3, that is the shape the script has
+//! to produce, and it needs an `eq` primitive after all — [`eq_eval`].
+//!
+//! # Threading, and why it needs no per-round work
+//!
+//! The natural guess is that a carried pair has to be rewritten every round, its
+//! weight picking up a factor as the sumcheck binds variables. It does not. The
+//! constraints are simply *accumulated*, and at the end each is evaluated
+//! against the concatenation of every round's folding randomness:
+//!
+//! ```text
+//! R = alpha^(0) || alpha^(1) || ... || alpha^(final)
+//! ```
+//!
+//! A constraint created at round `i` is over `n_c` variables, and the randomness
+//! that binds those variables is everything from round `i` onwards — the **last
+//! `n_c` coordinates of `R`**. That is exactly `get_subpoint_over_range(..n_c)`
+//! on the reversed point, reversed back.
+//!
+//! On a stack this rule costs nothing to implement. Push `R` with `R[0]` deepest
+//! and the last `n_c` coordinates are the *topmost* `n_c` elements, so every
+//! constraint reads from the top and a longer one simply reaches further down.
+//! No slicing, no arithmetic on offsets, and no per-round rewriting: see
+//! [`constraint_eval`].
+//!
+//! Together with the row-to-leaf binding in [`poseidon2::merkle::hash_row`] and
+//! [`combine_answers`], this is what makes a query *constrain* something. Before,
+//! an answer was authenticated against the commitment and then dropped; now it
+//! reaches the claim, and the claim reaches the closing identity.
 
 use crate::treepp::*;
 use poseidon2::ext4;
@@ -72,6 +115,205 @@ pub fn combine_answers(t: usize) -> Script {
         { ext4::drop_n(1) }
         { ext4::from_altstack() }
         { ext4::add() }
+    }
+}
+
+/// `eq(z, r)` over `EF`, with `under` extension elements sitting above `r`.
+///
+/// # The identity
+///
+/// The equality polynomial is a product of one factor per coordinate:
+///
+/// ```text
+/// eq(z, r) = prod_i ( z_i * r_i + (1 - z_i) * (1 - r_i) )
+///          = prod_i ( 1 + 2*z_i*r_i - z_i - r_i )
+/// ```
+///
+/// The second form is what Plonky3's `Point::eval_eq` uses, and it is worth a
+/// line of explanation because it is not a cosmetic rewrite: the first form is
+/// two multiplications per coordinate, the second is one. Over the quartic
+/// extension a multiplication is sixteen base multiplications, so halving them
+/// halves the dominant cost of this routine.
+///
+/// # Stack
+///
+/// The challenge `r` is the top `n` extension elements *underneath* `under`
+/// unrelated ones — `r[0]` deepest of the block, `r[n-1]` closest to the top.
+/// It is **copied, not consumed**, because several constraint groups read
+/// overlapping suffixes of the same randomness.
+///
+/// Altstack: the point `z`, popped `z[n-1]` first — the same order
+/// [`crate::multilinear::eval_multilinear`] consumes a point in, so one loader
+/// serves both and a point can be laid out once.
+///
+/// Out: the scalar, pushed on top.
+///
+/// # Why the challenge is read from the top
+///
+/// A constraint of arity `n` reads the *last* `n` coordinates of the total
+/// folding randomness (see the module docs). With `R[0]` deepest those are the
+/// topmost `n` elements, so the depth of `r[i]` is a function of `n` and `i`
+/// alone — the total length never enters. A group of larger arity reaches
+/// further down and needs no different code.
+pub fn eq_eval_at(n: usize, under: usize) -> Script {
+    script! {
+        { ext4::push_one() }
+        for i in (0..n).rev() {
+            { ext4::from_altstack() }            // z_i
+            // r_i, with the accumulator, z_i and `under` others above it.
+            { ext4::copy(under + n - i + 1) }
+            // 1 + 2*z_i*r_i - z_i - r_i, built above the two operands.
+            { ext4::copy(1) }                    // z_i
+            { ext4::copy(1) }                    // r_i
+            { ext4::mul() }
+            { ext4::copy(0) } { ext4::add() }    // doubled
+            { ext4::copy(2) } { ext4::sub() }    // - z_i
+            { ext4::copy(1) } { ext4::sub() }    // - r_i
+            { ext4::push_one() } { ext4::add() }
+            // Drop the two operands from under the factor, then fold it in.
+            { ext4::to_altstack() }
+            { ext4::drop_n(2) }
+            { ext4::from_altstack() }
+            { ext4::mul() }
+        }
+    }
+}
+
+/// [`eq_eval_at`] with the challenge on top of the stack.
+pub fn eq_eval(n: usize) -> Script {
+    eq_eval_at(n, 0)
+}
+
+/// A constraint point from a single field element: Plonky3's
+/// `Point::expand_from_univariate`.
+///
+/// Out-of-domain samples and shift queries are scalars, but a constraint's point
+/// is a vector. The expansion is the square-power vector
+///
+/// ```text
+/// expand(u, m) = [ u^(2^(m-1)), ..., u^4, u^2, u ]
+/// ```
+///
+/// which is the multilinear point whose `eq` picks out the univariate evaluation
+/// at `u` — the same `pow(x, m)` that turns a Reed-Solomon codeword into a
+/// multilinear one.
+///
+/// # Stack
+///
+/// In: `u(4)`. Out: nothing on the stack; the `m` coordinates are left on the
+/// altstack laid out exactly as [`eq_eval`] consumes them.
+///
+/// # Why no reordering is needed
+///
+/// Repeated squaring produces `u` first and `u^(2^(m-1))` last, so the powers
+/// land on the stack with `u` deepest. Moving the block to the altstack top
+/// first reverses it, which puts `u` — the point's *last* coordinate — on top,
+/// and that is the coordinate `eq_eval` pops first. The two conventions meet
+/// without a single extra roll.
+///
+/// # Cost
+///
+/// `m - 1` extension multiplications and no permutation.
+pub fn expand_univariate(m: usize) -> Script {
+    assert!(m >= 1, "a constraint point has at least one coordinate");
+    script! {
+        // u, u^2, u^4, ... with u deepest.
+        for _ in 1..m {
+            { ext4::copy(0) }
+            { ext4::copy(1) }
+            { ext4::mul() }
+        }
+        for _ in 0..m { { ext4::to_altstack() } }
+    }
+}
+
+/// `sum_j w_j * eq(z_j, r)` for one group of constraints sharing an arity.
+///
+/// This is the script form of Plonky3's
+/// `dot_product(eq_statement.weights_at(&local_challenge), challenge_powers(shift))`.
+/// The weights arrive as values rather than as powers of a batching challenge,
+/// so the same routine serves any group whose weights the caller has already
+/// formed — [`combine_answers`] forms them the same way for `sigma'`.
+///
+/// # Stack
+///
+/// In: the challenge, its top `n_vars` extension elements being this group's
+/// local point. Preserved.
+/// Altstack, per constraint in order: the weight `w_j`, then the `n_vars`
+/// coordinates of `z_j` — the layout [`closing_check`] already takes, where the
+/// coordinates pop first and the weight is underneath them.
+/// Out: the accumulated scalar, pushed above the challenge.
+///
+/// # Cost
+///
+/// `2 * n_vars + 2` extension multiplications per constraint and no permutation.
+/// Against the `depth` permutations each constraint's answer already cost to
+/// authenticate, threading is free; opening is what a WHIR verifier pays for.
+pub fn weights_at(n_points: usize, n_vars: usize) -> Script {
+    script! {
+        { ext4::push_zero() }
+        for _ in 0..n_points {
+            { eq_eval_at(n_vars, 1) }            // only the accumulator is above r
+            { ext4::from_altstack() }            // w_j, underneath its coordinates
+            { ext4::mul() }
+            { ext4::add() }
+        }
+    }
+}
+
+/// `evaluation_of_weights`: the accumulated constraint polynomial at the folding
+/// point, the script form of Plonky3's `eval_constraints_poly`.
+///
+/// # What this closes
+///
+/// [`combine_answers`] carries each round's answers into the next target and
+/// this carries each round's *points* to the end, so the closing identity is
+/// checked against the constraints the transcript actually accumulated rather
+/// than against a list supplied by the spender. That was the last link outside
+/// the script.
+///
+/// # Stack
+///
+/// In: the total folding randomness `R`, `total_vars` extension elements with
+/// `R[0]` deepest — the concatenation of every round's sumcheck randomness in
+/// round order, which is the order the rounds produced it in.
+/// Altstack: the groups in the order given, each laid out as [`weights_at`]
+/// expects.
+/// Out: the single scalar. `R` is consumed.
+///
+/// `groups` is `(constraints, arity)` per round, arity being the number of
+/// variables that round's commitment had. Nothing requires the arities to be
+/// sorted: each group reads its own suffix of `R` by reading that many elements
+/// from the top.
+///
+/// The result is the `weight` that [`crate::verifier::final_check`] multiplies
+/// against `f_M` at the final sumcheck randomness.
+pub fn constraint_eval(total_vars: usize, groups: &[(usize, usize)]) -> Script {
+    // `script!` takes no local bindings, so the per-group blocks are built here.
+    let blocks: Vec<Script> = groups
+        .iter()
+        .map(|&(n_points, n_vars)| {
+            assert!(
+                n_vars <= total_vars,
+                "a constraint of arity {n_vars} cannot read a suffix of {total_vars} coordinates"
+            );
+            script! {
+                for _ in 0..n_points {
+                    { eq_eval_at(n_vars, 1) }
+                    { ext4::from_altstack() }
+                    { ext4::mul() }
+                    { ext4::add() }
+                }
+            }
+        })
+        .collect();
+    script! {
+        { ext4::push_zero() }
+        for b in blocks { { b } }
+        // The randomness has done its work; drop it from under the result.
+        { ext4::to_altstack() }
+        { ext4::drop_n(total_vars) }
+        { ext4::from_altstack() }
     }
 }
 
