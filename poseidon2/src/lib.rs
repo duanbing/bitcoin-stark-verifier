@@ -30,6 +30,7 @@
 //! [`rust-bitcoin-m31`]: https://github.com/Bitcoin-Wildlife-Sanctuary/rust-bitcoin-m31
 
 pub mod constants;
+pub mod disprove;
 pub mod ext4;
 pub mod field;
 pub mod merkle;
