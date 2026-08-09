@@ -606,3 +606,102 @@ fn full_proof_verifies_as_one_script() {
     }
     println!("  every perturbation of the prover's evaluations is rejected\n");
 }
+
+/// The script's leaf hash is Plonky3's leaf hash, on a real proof's row.
+///
+/// Everything else about leaf hashing is checked against this crate's own
+/// reference, which shows the two agree rather than that either is right. This
+/// closes the chain to `PaddingFreeSponge<Perm, 16, 8, 8>` itself, using the row
+/// the prover actually committed to, and then walks the real path with it.
+///
+/// That is what turns a query opening into one unit: the row goes in, the root
+/// is checked, and no leaf digest is taken on trust in between. Without it the
+/// walk proves that *some* committed leaf sits at the index while the values
+/// folded into the constraint arrive as an unrelated hint.
+#[test]
+fn script_leaf_hash_agrees_with_plonky3_on_a_real_row() {
+    use p3_symmetric::CryptographicHasher;
+    use p3_whir::pcs::proof::QueryOpenings;
+    use poseidon2::merkle::{self, DIGEST};
+
+    // One query, so the opening is a single row against a single path. The
+    // property under test is per-opening; more of them would only repeat it.
+    SECURITY_LEVEL.with(|v| *v.borrow_mut() = 1);
+    RATE_LOG.with(|v| *v.borrow_mut() = 2);
+    let (commitment, proof) = prove();
+    SECURITY_LEVEL.with(|v| *v.borrow_mut() = 32);
+    RATE_LOG.with(|v| *v.borrow_mut() = 1);
+
+    let QueryOpenings::Base(open) = &proof.whir.final_openings else { panic!("base opening") };
+    assert_eq!(open.rows.len(), 1, "expected a single-query configuration");
+    let row: Vec<u32> = open.rows[0].iter().map(|x| x.as_canonical_u32()).collect();
+    assert!(!row.is_empty(), "the opened row is empty");
+
+    // 1. Plonky3's own hasher.
+    let h = MyHash::new(default_koalabear_poseidon2_16());
+    let want: Vec<u32> = h
+        .hash_iter(open.rows[0].iter().copied())
+        .iter()
+        .map(|x: &F| x.as_canonical_u32())
+        .collect::<Vec<_>>();
+
+    // 2. This crate's reference.
+    assert_eq!(
+        reference_hash_row(&row),
+        want,
+        "the Rust reference disagrees with Plonky3's PaddingFreeSponge"
+    );
+
+    // 3. The script.
+    let got = run(script! {
+        for x in row.iter() { {*x} }
+        { merkle::hash_row(row.len()) }
+    });
+    assert_eq!(got, want, "the script disagrees with Plonky3's PaddingFreeSponge");
+    println!("\n  leaf hash: script == reference == Plonky3, on a {}-element row", row.len());
+
+    // 4. And it feeds the real path against the real commitment root.
+    let sibs_f = &open.proof.sibling_hashes;
+    let depth = sibs_f.len();
+    let sibs: Vec<[u32; DIGEST]> =
+        sibs_f.iter().map(|s| core::array::from_fn(|i| s[i].as_canonical_u32())).collect();
+    let root: Vec<u32> = commitment.roots()[0].iter().map(|x| x.as_canonical_u32()).collect();
+    let leaf: [u32; DIGEST] = core::array::from_fn(|i| want[i]);
+    let index = (0..(1usize << depth))
+        .find(|&i| {
+            let b: Vec<bool> = (0..depth).map(|k| (i >> k) & 1 == 1).collect();
+            poseidon2::reference::merkle_root(leaf, &sibs, &b).to_vec() == root
+        })
+        .expect("opening authenticates");
+    let bits: Vec<bool> = (0..depth).map(|i| (index >> i) & 1 == 1).collect();
+
+    let opening = |row: &[u32]| {
+        script! {
+            for x in root.iter() { {*x} }
+            for i in (0..depth).rev() { for x in sibs[i].iter() { {*x} } }
+            for x in row.iter() { {*x} }
+            { merkle::hash_row(row.len()) }
+            for &b in bits.iter().rev() { { if b { 1u32 } else { 0u32 } } OP_TOALTSTACK }
+            { merkle::merkle_verify_from_altstack(depth) }
+            OP_TRUE
+        }
+    };
+
+    let ok = bitcoin_scriptexec::execute_script(opening(&row));
+    assert!(ok.error.is_none(), "the real opening was rejected: {:?}", ok.error);
+    println!("  row -> leaf -> root: one unit, no digest taken on trust");
+
+    // Substituting a row for the same leaf is the attack the hash exists to stop.
+    for i in 0..row.len() {
+        let mut other = row.clone();
+        other[i] = poseidon2::reference::add(other[i], 1);
+        let bad = bitcoin_scriptexec::execute_script(opening(&other));
+        assert!(bad.error.is_some(), "a row with element {i} substituted was accepted");
+    }
+    println!("  every substitution of the committed row is rejected\n");
+}
+
+/// Named so the test above reads as three independent computations.
+fn reference_hash_row(row: &[u32]) -> Vec<u32> {
+    poseidon2::reference::hash_row(row).to_vec()
+}
