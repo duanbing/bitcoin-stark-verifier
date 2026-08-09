@@ -118,3 +118,16 @@ pub fn combine_answers(base: [u32; 4], gamma: [u32; 4], answers: &[[u32; 4]]) ->
     }
     acc
 }
+
+/// `sum_j w_j * f_M(z_j)`: the mirror of [`crate::constraint::closing_check`].
+///
+/// Returns the accumulated left-hand side, so a test can compare it with the
+/// target rather than only observing that the script accepted.
+pub fn closing_sum(evals: &[[u32; 4]], points: &[([u32; 4], Vec<[u32; 4]>)]) -> [u32; 4] {
+    use poseidon2::reference::ext4;
+    let mut acc = [0u32; 4];
+    for (w, z) in points {
+        acc = ext4::add(acc, ext4::mul(*w, eval_multilinear(evals, z)));
+    }
+    acc
+}

@@ -128,6 +128,14 @@ pub fn push_one() -> Script {
     script! { 1 0 0 0 }
 }
 
+/// Push the additive identity.
+///
+/// Written out rather than as four literal zeros at the call site, so that an
+/// accumulator's starting value reads as a field element and not as padding.
+pub fn push_zero() -> Script {
+    script! { 0 0 0 0 }
+}
+
 /// Drop `n` extension elements.
 pub fn drop_n(n: usize) -> Script {
     script! { for _ in 0..(2 * n) { OP_2DROP } }
