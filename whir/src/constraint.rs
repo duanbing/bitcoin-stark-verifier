@@ -289,6 +289,22 @@ pub fn weights_at(n_points: usize, n_vars: usize) -> Script {
 /// The result is the `weight` that [`crate::verifier::final_check`] multiplies
 /// against `f_M` at the final sumcheck randomness.
 pub fn constraint_eval(total_vars: usize, groups: &[(usize, usize)]) -> Script {
+    constraint_eval_at(total_vars, groups, 0)
+}
+
+/// [`constraint_eval`] with `under` unrelated extension elements above `R`.
+///
+/// The composed verifier reaches the closing identity holding the chained claim
+/// and the final polynomial's value, both of which sit above the randomness and
+/// both of which are still needed afterwards. Parking them on the altstack is
+/// not an option — the constraint list is down there, and anything pushed above
+/// it would be popped in its place — so the offset is threaded through instead.
+///
+/// # Stack
+///
+/// In: `R(4*total_vars) X(4*under)`.
+/// Out: `X(4*under) w`, with `R` consumed.
+pub fn constraint_eval_at(total_vars: usize, groups: &[(usize, usize)], under: usize) -> Script {
     // `script!` takes no local bindings, so the per-group blocks are built here.
     let blocks: Vec<Script> = groups
         .iter()
@@ -299,7 +315,8 @@ pub fn constraint_eval(total_vars: usize, groups: &[(usize, usize)]) -> Script {
             );
             script! {
                 for _ in 0..n_points {
-                    { eq_eval_at(n_vars, 1) }
+                    // The accumulator, plus whatever the caller left above `R`.
+                    { eq_eval_at(n_vars, 1 + under) }
                     { ext4::from_altstack() }
                     { ext4::mul() }
                     { ext4::add() }
@@ -307,13 +324,16 @@ pub fn constraint_eval(total_vars: usize, groups: &[(usize, usize)]) -> Script {
             }
         })
         .collect();
+    // Slots standing above `R` once the accumulator exists.
+    let above = ext4::D * (under + 1);
+    let r_slots = ext4::D * total_vars;
     script! {
         { ext4::push_zero() }
         for b in blocks { { b } }
-        // The randomness has done its work; drop it from under the result.
-        { ext4::to_altstack() }
-        { ext4::drop_n(total_vars) }
-        { ext4::from_altstack() }
+        // The randomness has done its work. It is at the bottom with live values
+        // above it, so each slot is rolled up and dropped rather than parked:
+        // parking would reverse the order of what sits above.
+        for j in 0..r_slots { { r_slots + above - 1 - j } OP_ROLL OP_DROP }
     }
 }
 

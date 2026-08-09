@@ -22,7 +22,7 @@
 
 use crate::sponge::RATE;
 use crate::treepp::*;
-use crate::{challenger, sponge, sumcheck};
+use crate::{challenger, constraint, sponge, sumcheck};
 use poseidon2::ext4;
 use poseidon2::field;
 use poseidon2::merkle;
@@ -54,6 +54,23 @@ pub struct Config {
     pub final_poly_vars: usize,
 }
 
+impl Config {
+    /// Coordinates of folding randomness the whole schedule produces: one per
+    /// sumcheck round, which is what [`sumcheck::sumcheck_rounds_fs_keep`]
+    /// leaves on the stack.
+    pub fn total_folding_vars(&self) -> usize {
+        self.initial_folding_factor
+            + self.rounds.iter().map(|r| r.folding_factor).sum::<usize>()
+            + self.final_sumcheck_rounds
+    }
+
+    /// Coordinates accumulated by the time the final polynomial is absorbed —
+    /// everything except the final sumcheck rounds, which come after it.
+    pub fn randomness_before_final(&self) -> usize {
+        self.total_folding_vars() - self.final_sumcheck_rounds
+    }
+}
+
 /// Absorb `n` field elements taken from the altstack, splitting across
 /// rate-sized blocks as the duplex does. Each block is one permutation.
 ///
@@ -75,6 +92,57 @@ fn absorb_n_from_altstack(n: usize) -> Script {
             script! {
                 for _ in 0..block { OP_FROMALTSTACK }
                 { sponge::absorb(block) }
+            }
+        })
+        .collect();
+    script! { for b in blocks { { b } } }
+}
+
+/// Absorb `n` elements from the altstack, keeping a copy beneath the randomness.
+///
+/// The final polynomial is the one transcript item the verifier needs *twice*:
+/// once absorbed, so the challenges depend on it, and once evaluated, because
+/// the closing identity is `claimed == w(R) * f_M(r_fin)`. Supplying it twice in
+/// the witness would be the cheaper-looking option and a hole — the two copies
+/// could differ, so the transcript would commit to one polynomial while the
+/// check used another. The copy is therefore made in script.
+///
+/// `r_len` is how many extension elements of folding randomness are already
+/// accumulated. The copy is buried *below* them rather than directly under the
+/// claim, which is what keeps `R` contiguous: a later sumcheck round buries its
+/// challenge directly under the claim, and if the polynomial sat there too it
+/// would land in the middle of the randomness and `constraint_eval` could no
+/// longer read a suffix.
+///
+/// # Stack
+///
+/// In: `F(prev) R(4*r_len) claim(4) state(16)`, the values on the altstack.
+/// Out: `F(prev) F(new) R(4*r_len) claim(4) state'(16)`.
+///
+/// # Cost
+///
+/// Unchanged: one permutation per rate block. The burial and the copy are rolls
+/// and picks at a constant depth — around three bytes a slot against 572 228 for
+/// the block's permutation.
+fn absorb_n_from_altstack_keep(n: usize, r_len: usize) -> Script {
+    // Everything that has to end up above the buried block: the randomness, the
+    // claim and the sponge state.
+    let region = ext4::D * r_len + ext4::D + sponge::WIDTH;
+    let blocks: Vec<Script> = (0..n.div_ceil(RATE))
+        .map(|chunk| {
+            let b = core::cmp::min(RATE, n - chunk * RATE);
+            // The deepest slot of the region while the block sits above it, and
+            // — the same number — the deepest slot of the block once the region
+            // is back above it. Both stay constant as their loop runs, because
+            // each step removes one item from below and adds one above.
+            let depth = b + region - 1;
+            script! {
+                for _ in 0..b { OP_FROMALTSTACK }
+                // Sink the block beneath the randomness.
+                for _ in 0..region { { depth } OP_ROLL }
+                // Copy it back up to be absorbed.
+                for _ in 0..b { { depth } OP_PICK }
+                { sponge::absorb(b) }
             }
         })
         .collect();
@@ -176,16 +244,14 @@ pub fn final_check() -> Script {
 ///
 /// Two links remain outside the script, and neither is a matter of wiring:
 ///
-/// - **The closing identity is not emitted here.** Every input it needs now
-///   exists: the folding randomness is accumulated on the stack by
-///   [`sumcheck::sumcheck_rounds_fs_keep`],
-///   [`crate::constraint::expand_univariate`] turns a sampled scalar into a
-///   constraint point and [`crate::constraint::constraint_eval`] evaluates the
-///   accumulated constraints against the randomness, which is what
-///   [`final_check`] multiplies against the final polynomial. What this function
-///   does not do is choose the witness layout for the constraint weights, so it
-///   stops at the transcript and leaves `R` on the stack for a caller to close
-///   over.
+/// - **The query openings are not composed into the schedule.** [`open_query`]
+///   authenticates one, and [`permutation_count`] prices them all, but the
+///   spine does not yet emit them. That is what still stands between this and a
+///   verifier: the openings are where the constraints other than the statement
+///   come from, and the batching challenge `gamma` that weights them is sampled
+///   from the transcript position they occupy. Until they are in the spine there
+///   is no `gamma` in it to derive those weights from, which is why [`close`]
+///   takes its constraint list rather than building it.
 ///
 /// So this is the part of the verifier that is *checked*, not the whole
 /// verifier. [`permutation_count`] prices the whole schedule including queries;
@@ -214,9 +280,109 @@ pub fn verify(cfg: &Config) -> Script {
 
         // The final polynomial arrives in the clear and is absorbed whole. Its
         // evaluations are extension elements, so each is `ext4::D` base ones --
-        // `observe_algebra_slice`, not `observe_slice`.
-        { absorb_n_from_altstack(ext4::D << cfg.final_poly_vars) }
+        // `observe_algebra_slice`, not `observe_slice`. A copy is kept, because
+        // the closing identity evaluates it.
+        { absorb_n_from_altstack_keep(ext4::D << cfg.final_poly_vars, cfg.randomness_before_final()) }
         { sumcheck::sumcheck_rounds_fs_keep(cfg.final_sumcheck_rounds) }
+    }
+}
+
+/// The closing identity, on the stack [`verify`] leaves.
+///
+/// ```text
+/// claimed_eval == w(R) * f_M(r_fin)
+/// ```
+///
+/// This is where the transcript stops being a transcript and becomes a check.
+/// Everything it multiplies together is derived: `R` is accumulated by the
+/// sumcheck rounds, `f_M` is the copy [`absorb_n_from_altstack_keep`] kept of
+/// the polynomial that was absorbed, and `r_fin` is the tail of `R`.
+///
+/// # Stack
+///
+/// In: `F(4*2^v) R(4m) claim(4) state(16)` — exactly [`verify`]'s output.
+/// Altstack: the constraint list, laid out as [`constraint::constraint_eval`]
+/// expects. It has to be pushed *first* by the spender, beneath the whole
+/// transcript, so that it is what remains once the transcript is consumed.
+///
+/// # What the constraint list may contain
+///
+/// For a plain evaluation opening the list is a single entry of weight one --
+/// the statement `f(z) = sigma` itself, whose point is public and whose weight
+/// needs no batching challenge. That case is complete: nothing in the identity
+/// is the spender's to choose.
+///
+/// The out-of-domain and shift constraints are weighted by powers of a `gamma`
+/// sampled after each round's answers are absorbed. Those weights must be
+/// derived in script for the same reason the sumcheck challenges must be, and
+/// they cannot be until [`verify`] composes the query openings that fix where
+/// `gamma` sits in the transcript. Passing them in here would be the same defect
+/// as supplying a sumcheck challenge.
+/// Out: nothing. The spend is invalid unless the identity holds in all four
+/// coefficients.
+///
+/// # Why the sponge is simply dropped
+///
+/// Its work is done: every challenge has been squeezed out of it, and each one
+/// is already baked into `R` and into the chained claim. Nothing downstream
+/// reads it, and keeping it would only mean carrying sixteen slots through the
+/// closing arithmetic.
+///
+/// # Cost
+///
+/// No permutation at all. One multilinear evaluation of `v` variables, one
+/// `eq` per constraint, and rolls. The closing identity is arithmetic, and at
+/// this resolution arithmetic is free — which is worth stating plainly, because
+/// it means the reason a WHIR verifier does not fit on Bitcoin is entirely the
+/// Merkle openings and not the algebra.
+pub fn close(cfg: &Config, groups: &[(usize, usize)]) -> Script {
+    // In Plonky3 these are the same quantity: the final polynomial has one
+    // variable per final sumcheck round, and is evaluated at that round's
+    // randomness. Splitting them into two fields is this crate's own doing, so
+    // the closing check is where the two have to be reconciled.
+    assert_eq!(
+        cfg.final_poly_vars, cfg.final_sumcheck_rounds,
+        "the final polynomial is evaluated at the final sumcheck randomness, so it has one \
+         variable per final sumcheck round"
+    );
+    let v = cfg.final_sumcheck_rounds;
+    let m = cfg.total_folding_vars();
+    let n_evals = 1usize << cfg.final_poly_vars;
+    // The final polynomial, lying beneath the randomness and the claim.
+    let lift = ext4::D * n_evals + ext4::D * m + ext4::D - 1;
+    script! {
+        // The sponge has nothing left to say.
+        for _ in 0..sponge::WIDTH { OP_DROP }
+
+        // Bring the final polynomial up over `R` and the claim.
+        for _ in 0..(ext4::D * n_evals) { { lift } OP_ROLL }
+
+        // The point it is evaluated at is the *final* sumcheck randomness, the
+        // tail of `R`. `eval_multilinear` pops the last variable first, and the
+        // altstack is last-in-first-out, so the last variable has to be pushed
+        // *last* -- the copy runs from the deepest coordinate upwards, not from
+        // the top down. The `+ 1` steps over the claim, which the lift left
+        // between the polynomial and the randomness.
+        for i in (0..v).rev() { { ext4::copy(n_evals + 1 + i) } { ext4::to_altstack() } }
+        { crate::multilinear::eval_multilinear(cfg.final_poly_vars) }
+
+        // w(R). The claim and f_M(r_fin) sit above the randomness and are both
+        // still needed, so they are stepped over rather than parked.
+        { constraint::constraint_eval_at(m, groups, 2) }
+
+        // final_check wants `claimed weight f_at_r`; lift the value over the
+        // weight, deepest slot first.
+        for _ in 0..ext4::D { { 2 * ext4::D - 1 } OP_ROLL }
+        { final_check() }
+    }
+}
+
+/// [`verify`] followed by [`close`]: the whole transcript and the identity it
+/// exists to reach.
+pub fn verify_and_close(cfg: &Config, groups: &[(usize, usize)]) -> Script {
+    script! {
+        { verify(cfg) }
+        { close(cfg, groups) }
     }
 }
 

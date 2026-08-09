@@ -552,3 +552,28 @@ fn expand_univariate_matches_plonky3() {
         );
     }
 }
+
+/// Isolate `constraint_eval_at` with values above the randomness.
+#[test]
+fn constraint_eval_at_steps_over_what_sits_above() {
+    let mut rng = ChaCha20Rng::seed_from_u64(60);
+    let total = 4usize;
+    let r: Vec<[u32; 4]> = (0..total).map(|_| rand_ef(&mut rng)).collect();
+    let shape = [(1usize, 4usize)];
+    let groups = vec![vec![(rand_ef(&mut rng), (0..4).map(|_| rand_ef(&mut rng)).collect::<Vec<_>>())]];
+    let want = reference::constraint_eval(&r, &groups);
+
+    for under in 0..3usize {
+        let above: Vec<[u32; 4]> = (0..under).map(|_| rand_ef(&mut rng)).collect();
+        let got = run(script! {
+            { groups_to_altstack(&groups) }
+            { push_randomness(&r) }
+            for x in above.iter() { { push_ef(*x) } }
+            { constraint::constraint_eval_at(total, &shape, under) }
+        });
+        assert_eq!(got.len(), 4 * (under + 1), "under = {under}: wrong stack shape");
+        assert_eq!(&got[..4 * under], above.concat().as_slice(),
+                   "under = {under}: the values above the randomness were disturbed");
+        assert_eq!(&got[4 * under..], want.as_slice(), "under = {under}: wrong weight");
+    }
+}

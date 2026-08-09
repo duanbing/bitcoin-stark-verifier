@@ -119,7 +119,7 @@ fn small() -> Config {
         initial_folding_factor: 2,
         rounds: vec![Round { folding_factor: 2, num_queries: 3, log_domain_size: 6, ood_samples: 1 }],
         final_round: Round { folding_factor: 2, num_queries: 3, log_domain_size: 4, ood_samples: 1 },
-        final_sumcheck_rounds: 1,
+        final_sumcheck_rounds: 2,
         final_poly_vars: 2,
     }
 }
@@ -138,6 +138,11 @@ struct Spine {
     items: Vec<u32>,
     claim: [u32; 4],
     state: [u32; 16],
+    /// Every round's folding randomness, concatenated in round order.
+    randomness: Vec<[u32; 4]>,
+    /// The final polynomial, which `verify` keeps a copy of because the closing
+    /// identity evaluates it.
+    final_poly: Vec<[u32; 4]>,
 }
 
 fn build_spine(cfg: &Config, rng: &mut ChaCha20Rng, state0: [u32; 16], claim0: [u32; 4]) -> Spine {
@@ -145,13 +150,15 @@ fn build_spine(cfg: &Config, rng: &mut ChaCha20Rng, state0: [u32; 16], claim0: [
     let mut state = state0;
     let mut claim = claim0;
 
-    let sumcheck = |n: usize, items: &mut Vec<u32>, state: &mut [u32; 16], claim: &mut [u32; 4], rng: &mut ChaCha20Rng| {
+    let mut randomness: Vec<[u32; 4]> = Vec::new();
+    let mut sumcheck = |n: usize, items: &mut Vec<u32>, state: &mut [u32; 16], claim: &mut [u32; 4], rng: &mut ChaCha20Rng, randomness: &mut Vec<[u32; 4]>| {
         for _ in 0..n {
             let (c0, c_inf) = (rand_ef(rng), rand_ef(rng));
             items.extend_from_slice(&c0);
             items.extend_from_slice(&c_inf);
-            let (next, _) = reference::sumcheck_round_fs(state, *claim, c0, c_inf);
+            let (next, r) = reference::sumcheck_round_fs(state, *claim, c0, c_inf);
             *claim = next;
+            randomness.push(r);
         }
     };
     let absorb = |n: usize, items: &mut Vec<u32>, state: &mut [u32; 16], rng: &mut ChaCha20Rng| {
@@ -162,7 +169,7 @@ fn build_spine(cfg: &Config, rng: &mut ChaCha20Rng, state0: [u32; 16], claim0: [
         }
     };
 
-    sumcheck(cfg.initial_folding_factor, &mut items, &mut state, &mut claim, rng);
+    sumcheck(cfg.initial_folding_factor, &mut items, &mut state, &mut claim, rng, &mut randomness);
     for r in cfg.rounds.iter() {
         absorb(poseidon2::merkle::DIGEST, &mut items, &mut state, rng);
         // The point is sampled from the rate the previous absorb produced, and
@@ -171,12 +178,17 @@ fn build_spine(cfg: &Config, rng: &mut ChaCha20Rng, state0: [u32; 16], claim0: [
         for _ in 0..r.ood_samples {
             absorb(4, &mut items, &mut state, rng);
         }
-        sumcheck(r.folding_factor, &mut items, &mut state, &mut claim, rng);
+        sumcheck(r.folding_factor, &mut items, &mut state, &mut claim, rng, &mut randomness);
     }
+    let poly_start = items.len();
     absorb(4 << cfg.final_poly_vars, &mut items, &mut state, rng);
-    sumcheck(cfg.final_sumcheck_rounds, &mut items, &mut state, &mut claim, rng);
+    let final_poly: Vec<[u32; 4]> = items[poly_start..]
+        .chunks(4)
+        .map(|c| [c[0], c[1], c[2], c[3]])
+        .collect();
+    sumcheck(cfg.final_sumcheck_rounds, &mut items, &mut state, &mut claim, rng, &mut randomness);
 
-    Spine { items, claim, state }
+    Spine { items, claim, state, randomness, final_poly }
 }
 
 /// The spine executes, and lands where the reference does.
@@ -202,9 +214,14 @@ fn transcript_spine_executes_and_matches_the_reference() {
     });
 
     let m = total_folding_vars(&cfg);
-    assert_eq!(got.len(), 4 * m + 4 + 16, "unexpected stack shape");
-    assert_eq!(&got[4 * m..4 * m + 4], &want.claim, "claim disagrees with the reference");
-    assert_eq!(&got[4 * m + 4..], &want.state, "sponge state disagrees with the reference");
+    let f = 4 * (1usize << cfg.final_poly_vars);
+    assert_eq!(got.len(), f + 4 * m + 4 + 16, "unexpected stack shape");
+    assert_eq!(&got[..f], want.final_poly.concat().as_slice(),
+               "the kept final polynomial is wrong, or in the wrong place");
+    assert_eq!(&got[f..f + 4 * m], want.randomness.concat().as_slice(),
+               "the folding randomness is not contiguous beneath the claim");
+    assert_eq!(&got[f + 4 * m..f + 4 * m + 4], &want.claim, "claim disagrees with the reference");
+    assert_eq!(&got[f + 4 * m + 4..], &want.state, "sponge state disagrees with the reference");
 }
 
 /// Changing one byte of the transcript changes the claim the spine reaches.
@@ -234,8 +251,9 @@ fn transcript_spine_is_sensitive_to_every_absorbed_value() {
             { verifier::verify(&cfg) }
         });
         let m = total_folding_vars(&cfg);
+        let f = 4 * (1usize << cfg.final_poly_vars);
         assert_ne!(
-            &got[4 * m..4 * m + 4],
+            &got[f + 4 * m..f + 4 * m + 4],
             &want.claim,
             "perturbing transcript position {i} left the claim unchanged"
         );
@@ -247,12 +265,63 @@ fn transcript_spine_is_sensitive_to_every_absorbed_value() {
 /// `permutation_count` prices the whole schedule including the query openings
 /// the spine does not yet compose, so the comparison is against the spine's
 /// share: absorbs and sumcheck rounds, one permutation each.
+///
+/// # Why this is a difference and not a division
+///
+/// The obvious test is `verify(&cfg).len() / one`, and it worked until the
+/// arithmetic grew. A sumcheck round is one permutation *plus* about 95 kB of
+/// extension-field arithmetic, and six rounds of that is itself more than a
+/// permutation -- so the quotient started reporting one too many and would have
+/// been "fixed" by adjusting the prediction, which is exactly the wrong
+/// direction. Differences isolate the permutation from the arithmetic around it:
+/// two configurations that differ by one absorb differ in length by one
+/// permutation and nothing else.
 #[test]
-fn permutation_count_agrees_with_the_emitted_spine() {
+fn one_more_absorb_is_one_more_permutation() {
+    let one = poseidon2::permutation::permute().len();
+
+    let bump = |mutate: &dyn Fn(&mut Config), what: &str, expect: usize| {
+        let base = small();
+        let mut grown = small();
+        mutate(&mut grown);
+        assert_eq!(
+            verifier::permutation_count(&grown) - verifier::permutation_count(&base),
+            expect,
+            "{what}: the accounting predicts a different number of permutations"
+        );
+        let delta = verifier::verify(&grown).len() - verifier::verify(&base).len();
+        let arithmetic = delta - expect * one;
+        assert!(
+            delta >= expect * one && arithmetic < one / 4,
+            "{what}: emitted {delta} B for {expect} permutation(s), \
+             which is {arithmetic} B of arithmetic -- too much to be bookkeeping"
+        );
+    };
+
+    // An out-of-domain sample is a squeeze off the current rate and a
+    // four-element absorb, so exactly one duplexing.
+    bump(&|c| c.rounds[0].ood_samples += 1, "one more OOD sample", 1);
+    // Doubling the final polynomial doubles the blocks it takes to absorb it.
+    bump(
+        &|c| {
+            c.final_poly_vars += 1;
+            c.final_sumcheck_rounds += 1;
+        },
+        "one more final variable",
+        // Twice the evaluations is twice the rate blocks, and one more sumcheck
+        // round to bind the new variable.
+        (4usize << small().final_poly_vars).div_ceil(reference::RATE) + 1,
+    );
+}
+
+/// The absolute count, with the arithmetic stated rather than hidden.
+///
+/// `permutation_count` is what decides whether a WHIR verifier fits on Bitcoin,
+/// so it is worth knowing how much of the emitted script it fails to describe.
+#[test]
+fn report_spine_arithmetic() {
     let cfg = small();
     let one = poseidon2::permutation::permute().len();
-    let spine_perms = verifier::verify(&cfg).len() / one;
-
     let sumcheck_rounds =
         cfg.initial_folding_factor + cfg.rounds.iter().map(|r| r.folding_factor).sum::<usize>()
             + cfg.final_sumcheck_rounds;
@@ -262,11 +331,18 @@ fn permutation_count_agrees_with_the_emitted_spine() {
         .map(|r| poseidon2::merkle::DIGEST.div_ceil(reference::RATE) + r.ood_samples)
         .sum::<usize>()
         + (4usize << cfg.final_poly_vars).div_ceil(reference::RATE);
-
-    assert_eq!(
-        spine_perms,
-        sumcheck_rounds + absorbs,
-        "the spine emits a different number of permutations than predicted"
+    let predicted = sumcheck_rounds + absorbs;
+    let emitted = verifier::verify(&cfg).len();
+    let arithmetic = emitted - predicted * one;
+    println!(
+        "\n  spine: {predicted} permutations = {} B, emitted {emitted} B\n  \
+         arithmetic and bookkeeping: {arithmetic} B ({:.1}% of the spine)\n",
+        predicted * one,
+        100.0 * arithmetic as f64 / emitted as f64
+    );
+    assert!(
+        arithmetic < emitted / 8,
+        "arithmetic is now more than an eighth of the spine; the cost law needs revisiting"
     );
 }
 
@@ -317,4 +393,230 @@ fn report_verifier_size() {
     println!("  blocks                       {:>12.1}", (perms * one) as f64 / BLOCK as f64);
     println!("\n  transcript share             {:>11.1}%", 100.0 * (perms - merkle) as f64 / perms as f64);
     println!();
+}
+
+// ---------------------------------------------------------------------------
+// The closing identity, on the stack the spine leaves
+// ---------------------------------------------------------------------------
+
+/// An `EF` element as Plonky3 sees it, so the test can use its inverse.
+fn to_ef(c: [u32; 4]) -> Ef {
+    use p3_field::{BasedVectorSpace, PrimeCharacteristicRing};
+    Ef::from_basis_coefficients_fn(|i| p3_koala_bear::KoalaBear::from_u32(c[i]))
+}
+
+type Ef = p3_field::extension::BinomialExtensionField<p3_koala_bear::KoalaBear, 4>;
+
+fn of_ef(x: Ef) -> [u32; 4] {
+    use p3_field::{BasedVectorSpace, PrimeField32};
+    let s: &[p3_koala_bear::KoalaBear] = x.as_basis_coefficients_slice();
+    core::array::from_fn(|i| s[i].as_canonical_u32())
+}
+
+/// Lay one constraint on the altstack: the weight, then the coordinates.
+fn constraint_to_altstack(w: [u32; 4], z: &[[u32; 4]]) -> bitcoin::ScriptBuf {
+    script! {
+        { push_ef(w) } for _ in 0..4 { OP_TOALTSTACK }
+        for c in z.iter() { { push_ef(*c) } for _ in 0..4 { OP_TOALTSTACK } }
+    }
+}
+
+/// Build a spend that satisfies the closing identity, and the pieces of it.
+struct Closing {
+    spine: Spine,
+    weight: [u32; 4],
+    point: Vec<[u32; 4]>,
+}
+
+fn build_closing(cfg: &Config, rng: &mut ChaCha20Rng, state0: [u32; 16], claim0: [u32; 4]) -> Closing {
+    let spine = build_spine(cfg, rng, state0, claim0);
+    let m = total_folding_vars(cfg);
+    assert_eq!(spine.randomness.len(), m);
+
+    // The final polynomial is evaluated at the tail of the randomness.
+    let v = cfg.final_poly_vars;
+    let r_fin = &spine.randomness[m - v..];
+    let f_at_r = reference::eval_multilinear(&spine.final_poly, r_fin);
+
+    // One constraint over every variable -- the evaluation query the whole
+    // protocol exists to answer. Its point is the statement, not a prover
+    // choice; its weight is solved for so that the instance is a *valid* one,
+    // the same way a prover would produce a proof that verifies.
+    let point: Vec<[u32; 4]> = (0..m).map(|_| rand_ef(rng)).collect();
+    let e = reference::eq_eval(&point, &spine.randomness);
+    let denom = to_ef(e) * to_ef(f_at_r);
+    assert_ne!(
+        denom,
+        <Ef as p3_field::PrimeCharacteristicRing>::ZERO,
+        "degenerate instance: eq or the final evaluation vanished"
+    );
+    let weight = of_ef(to_ef(spine.claim) * p3_field::Field::inverse(&denom));
+
+    // The reference agrees the identity holds, independently of any script.
+    let lhs = reference::constraint_eval(&spine.randomness, &[vec![(weight, point.clone())]]);
+    assert_eq!(
+        of_ef(to_ef(lhs) * to_ef(f_at_r)),
+        spine.claim,
+        "the constructed instance does not satisfy w(R) * f_M(r_fin) == claim"
+    );
+
+    Closing { spine, weight, point }
+}
+
+fn closing_spend(
+    cfg: &Config,
+    c: &Closing,
+    state0: [u32; 16],
+    claim0: [u32; 4],
+    items: &[u32],
+) -> bitcoin::ScriptBuf {
+    let m = total_folding_vars(cfg);
+    script! {
+        // The constraint list goes down first, beneath the whole transcript, so
+        // that it is what remains once the transcript has been consumed.
+        { constraint_to_altstack(c.weight, &c.point) }
+        { push_altstack(items) }
+        { push_ef(claim0) }
+        for s in state0 { {s} }
+        { verifier::verify_and_close(cfg, &[(1, m)]) }
+        OP_TRUE
+    }
+}
+
+/// The composed verifier runs to completion on a satisfying instance.
+///
+/// This is the first time the schedule ends in a *check* rather than in a
+/// transcript: every value the identity multiplies together is derived inside
+/// the script -- `R` from the sumcheck rounds, `f_M` from the copy the absorb
+/// kept, `r_fin` from the tail of `R` -- and the only thing the spender chooses
+/// is the constraint, which is the statement being proved.
+#[test]
+fn the_composed_verifier_closes() {
+    let mut rng = ChaCha20Rng::seed_from_u64(24);
+    let cfg = small();
+    let state0: [u32; 16] = core::array::from_fn(|_| rand_f(&mut rng));
+    let claim0 = rand_ef(&mut rng);
+    let c = build_closing(&cfg, &mut rng, state0, claim0);
+
+    let info = bitcoin_scriptexec::execute_script(closing_spend(&cfg, &c, state0, claim0, &c.spine.items));
+    assert!(
+        info.error.is_none(),
+        "the closing identity was rejected: {:?} at {:?}",
+        info.error,
+        info.last_opcode
+    );
+}
+
+/// Everything the identity rests on is load-bearing.
+///
+/// The point of listing these separately is that each one is a distinct way for
+/// the check to be vacuous, and this crate has shipped two of them before: a
+/// closing check that compared a value with itself, and a chain whose challenges
+/// the prover supplied.
+#[test]
+fn the_closing_identity_rejects_every_perturbation() {
+    let mut rng = ChaCha20Rng::seed_from_u64(25);
+    let cfg = small();
+    let state0: [u32; 16] = core::array::from_fn(|_| rand_f(&mut rng));
+    let claim0 = rand_ef(&mut rng);
+    let c = build_closing(&cfg, &mut rng, state0, claim0);
+
+    let rejects = |s: bitcoin::ScriptBuf, why: &str| {
+        assert!(bitcoin_scriptexec::execute_script(s).error.is_some(), "{why}: accepted");
+    };
+
+    // The weight, and every coordinate of the point.
+    for i in 0..4 {
+        let mut bad = c.weight;
+        bad[i] = pf::add(bad[i], 1);
+        rejects(
+            closing_spend(&cfg, &Closing { weight: bad, ..clone_closing(&c) }, state0, claim0, &c.spine.items),
+            &format!("weight coefficient {i}"),
+        );
+    }
+    for j in 0..c.point.len() {
+        let mut bad = c.point.clone();
+        bad[j][0] = pf::add(bad[j][0], 1);
+        rejects(
+            closing_spend(&cfg, &Closing { point: bad, ..clone_closing(&c) }, state0, claim0, &c.spine.items),
+            &format!("point coordinate {j}"),
+        );
+    }
+    // The initial claim, which the whole chain hangs from.
+    let mut bad_claim = claim0;
+    bad_claim[0] = pf::add(bad_claim[0], 1);
+    rejects(closing_spend(&cfg, &c, state0, bad_claim, &c.spine.items), "the initial claim");
+
+    // Any transcript value: it moves a squeezed challenge, which moves both the
+    // chained claim and the randomness the constraint is evaluated at.
+    for &i in [0usize, 7, c.spine.items.len() / 2, c.spine.items.len() - 1].iter() {
+        let mut items = c.spine.items.clone();
+        items[i] = pf::add(items[i], 1);
+        rejects(closing_spend(&cfg, &c, state0, claim0, &items), &format!("transcript position {i}"));
+    }
+}
+
+fn clone_closing(c: &Closing) -> Closing {
+    Closing {
+        spine: Spine {
+            items: c.spine.items.clone(),
+            claim: c.spine.claim,
+            state: c.spine.state,
+            randomness: c.spine.randomness.clone(),
+            final_poly: c.spine.final_poly.clone(),
+        },
+        weight: c.weight,
+        point: c.point.clone(),
+    }
+}
+
+/// What closing costs, against the transcript it closes.
+#[test]
+fn report_closing_size() {
+    let cfg = example();
+    let m = cfg.total_folding_vars();
+    let spine = verifier::verify(&cfg).len();
+    let closing = verifier::close(&cfg, &[(1, m)]).len();
+    println!(
+        "\n  spine {spine} B, closing {closing} B ({:.2}% of the spine, 0 permutations)\n",
+        100.0 * closing as f64 / spine as f64
+    );
+}
+
+/// The closing check's inputs, before it multiplies them.
+///
+/// A single `OP_EQUALVERIFY` at the end says only that something disagreed.
+/// Pinning `f_M(r_fin)` on its own -- and that the claim and the randomness are
+/// where they were -- turns that into a location. It found the bug it was
+/// written for: the coordinates were copied from the top down, and the altstack
+/// being last-in-first-out meant `eval_multilinear` then read the point
+/// backwards.
+#[test]
+fn the_closing_inputs_match_the_reference() {
+    let mut rng = ChaCha20Rng::seed_from_u64(24);
+    let cfg = small();
+    let state0: [u32; 16] = core::array::from_fn(|_| rand_f(&mut rng));
+    let claim0 = rand_ef(&mut rng);
+    let c = build_closing(&cfg, &mut rng, state0, claim0);
+    let m = total_folding_vars(&cfg);
+    let v = cfg.final_poly_vars;
+    let n_evals = 1usize << v;
+    let lift = 4 * n_evals + 4 * m + 4 - 1;
+
+    // Stage 1: drop the sponge, lift the polynomial, evaluate it.
+    let got = run_ok(script! {
+        { constraint_to_altstack(c.weight, &c.point) }
+        { push_altstack(&c.spine.items) }
+        { push_ef(claim0) }
+        for s in state0 { {s} }
+        { verifier::verify(&cfg) }
+        for _ in 0..16 { OP_DROP }
+        for _ in 0..(4 * n_evals) { { lift } OP_ROLL }
+        for i in (0..v).rev() { { poseidon2::ext4::copy(n_evals + 1 + i) } { poseidon2::ext4::to_altstack() } }
+        { whir::multilinear::eval_multilinear(v) }
+    });
+    let f_at_r = reference::eval_multilinear(&c.spine.final_poly, &c.spine.randomness[m - v..]);
+    assert_eq!(&got[got.len() - 4..], &f_at_r, "f_M(r_fin) disagrees");
+    assert_eq!(&got[got.len() - 8..got.len() - 4], &c.spine.claim, "the claim moved");
+    assert_eq!(&got[..4 * m], c.spine.randomness.concat().as_slice(), "the randomness moved");
 }
