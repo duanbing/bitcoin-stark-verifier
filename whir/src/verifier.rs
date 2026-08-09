@@ -96,18 +96,27 @@ fn absorb_n_from_altstack(n: usize) -> Script {
 /// *same* leaf. However many queries were configured, the soundness was that of
 /// one.
 ///
-/// Stack: the opening pushed as `root(8) siblings(8*depth) leaf(8)`. Consumes
-/// all of it and leaves nothing, so the caller's layout is preserved.
+/// The opening is one unit: the **row** goes in, the root is checked, and no
+/// leaf digest is taken on trust in between. [`merkle::hash_row`] reproduces the
+/// `PaddingFreeSponge` the commitment was built with, so the walk authenticates
+/// the values themselves.
 ///
-/// What this does not yet do is bind the opened *row* to the leaf. The leaf is a
-/// `PaddingFreeSponge` digest of the row and this crate has no row-to-digest
-/// routine, so the row is supplied as a hint and folded outside the script. The
-/// query therefore authenticates a committed leaf, not the values that reach the
-/// constraint.
-pub fn open_query(slot: usize, log_domain_size: usize) -> Script {
+/// That matters because the two halves of a query are separable and only one of
+/// them used to be checked. Walking the path proves that *some* committed leaf
+/// sits at the sampled index; if the leaf arrives as a hint alongside the row,
+/// nothing stops a spender authenticating the real leaf and folding a different
+/// row into the constraint. Hashing in script removes the seam.
+///
+/// Stack: the opening pushed as `root(8) siblings(8*depth) row(row_len)`.
+/// Consumes all of it and leaves nothing, so the caller's layout is preserved.
+/// `low_bits_to_altstack` puts the index bits underneath, and
+/// [`merkle::hash_row`] leaves the altstack as it found it, so the walk still
+/// finds them.
+pub fn open_query(slot: usize, log_domain_size: usize, row_len: usize) -> Script {
     script! {
         { challenger::sample(slot) }
         { field::low_bits_to_altstack(log_domain_size) }
+        { merkle::hash_row(row_len) }
         { merkle::merkle_verify_from_altstack(log_domain_size) }
     }
 }
@@ -171,7 +180,8 @@ pub fn final_check() -> Script {
 ///   `w'(Z,X) = w(Z,alpha,X) + Z * sum_i gamma^(i+1) eq(z_i, X)` and
 ///   `sigma' = h_k(alpha_k) + sum_i gamma^(i+1) y_i`. That needs `eq` over the
 ///   extension and powers of `gamma`, neither of which this crate has yet.
-/// - **A row is not bound to its leaf**, for the reason given on [`open_query`].
+/// A row *is* now bound to its leaf — see [`open_query`] — so what remains is
+/// the constraint itself.
 ///
 /// So this is the part of the verifier that is *checked*, not the whole
 /// verifier. [`permutation_count`] prices the whole schedule including queries;

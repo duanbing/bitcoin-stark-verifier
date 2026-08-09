@@ -51,10 +51,10 @@ Two links are still outside the script, and neither is a matter of wiring:
   batching the out-of-domain answer and the `t` shift answers into the next
   weight polynomial and target. That needs `eq` over the extension field and
   powers of `gamma`, neither of which this crate has yet.
-- **A row is not bound to its leaf.** The leaf is a `PaddingFreeSponge` digest of
-  the row and there is no row-to-digest routine here, so the row arrives as a
-  hint. A query authenticates a committed leaf, not the values that reach the
-  constraint.
+A row **is** bound to its leaf: `merkle::hash_row` reproduces Plonky3's
+`PaddingFreeSponge`, so a query opening is one unit — the row goes in, the root
+is checked, and no digest is taken on trust in between. Checked against Plonky3's
+own hasher on a row from a real proof, with every substitution rejected.
 
 So `verifier::verify` emits the part of the verifier that is *checked*, not the
 whole verifier, and its doc comment says so.

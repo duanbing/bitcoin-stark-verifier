@@ -214,3 +214,19 @@ pub mod ext4 {
         res
     }
 }
+
+/// `PaddingFreeSponge<_, 16, 8, 8>`: the mirror of [`crate::merkle::hash_row`].
+///
+/// Overwrite the first `RATE` state elements with each chunk and permute. A
+/// partial final chunk overwrites only what it fills and leaves the rest of the
+/// state alone — no padding, no length tag, which is what distinguishes this
+/// from the challenger's duplex.
+pub fn hash_row(row: &[u32]) -> [u32; 8] {
+    const RATE: usize = 8;
+    let mut state = [0u32; WIDTH];
+    for chunk in row.chunks(RATE) {
+        state[..chunk.len()].copy_from_slice(chunk);
+        permute(&mut state);
+    }
+    state[..8].try_into().expect("state is wider than a digest")
+}
