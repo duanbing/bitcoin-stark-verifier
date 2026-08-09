@@ -36,8 +36,28 @@ script against a Rust reference, which establishes that the two agree — not th
 either is right. Checking that Plonky3 accepts the proof is what makes the
 agreement meaningful: the object the script re-derives is known to be valid.
 
-No hand-built vectors are involved. The evaluations are whatever the prover
-chose to send.
+No hand-built vectors are involved: the evaluations are whatever the prover chose
+to send, and **the challenges are squeezed from the sponge inside the script**
+rather than supplied. That is what makes the run a check rather than a
+comparison — perturbing any evaluation the prover sent moves the squeezed
+challenge, which moves the chained claim, which breaks the closing identity. The
+test asserts exactly that, for every evaluation in the proof.
+
+### What is checked, and what is not
+
+Two links are still outside the script, and neither is a matter of wiring:
+
+- **Query answers are not folded into the constraint.** WHIR closes a round by
+  batching the out-of-domain answer and the `t` shift answers into the next
+  weight polynomial and target. That needs `eq` over the extension field and
+  powers of `gamma`, neither of which this crate has yet.
+- **A row is not bound to its leaf.** The leaf is a `PaddingFreeSponge` digest of
+  the row and there is no row-to-digest routine here, so the row arrives as a
+  hint. A query authenticates a committed leaf, not the values that reach the
+  constraint.
+
+So `verifier::verify` emits the part of the verifier that is *checked*, not the
+whole verifier, and its doc comment says so.
 
 ```
 cargo test                                  # everything
@@ -57,8 +77,22 @@ the rest are `.len()` on the public builders. Figures are for the test's witness
 | Merkle path at depth 21 | 12,017,292 — **3.0 blocks** |
 | `sumcheck_round()` | 95,100 |
 | `eval_multilinear(5)` | 740,010 |
-| `final_check()` | 1,447 |
-| **composed script, security 1, one query** | **4,938,680** |
+| **composed script, security 1, one query** | **8,967,342** |
+
+Every figure above is the length of a script that some test executes. The
+composed figure grew because the run now derives its own challenges and closes on
+an extension-field identity rather than taking both as hints.
+
+Binding the transcript is nonetheless *cheaper* per round, because absorbing is
+already the duplexing — Plonky3's `DuplexChallenger` permutes once when a
+`sample` follows an `observe`, and the previous schedule paid for an absorb and a
+squeeze. For the 2^20 example configuration `whir/tests/verifier.rs` reports:
+
+| | permutations |
+| --- | --- |
+| Merkle paths | 1,300 |
+| transcript | 44 |
+| **transcript share** | **3.3%** |
 
 For contrast, `verifier_cost.rs` notes that a byte hash under `OP_CAT` would make
 one Merkle level about **2 bytes**, so the same depth-21 path would be ~42 bytes.
