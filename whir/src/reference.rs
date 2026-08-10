@@ -178,6 +178,32 @@ pub fn constraint_eval(
     acc
 }
 
+/// The mirror of [`crate::constraint::constraint_eval_batched`].
+///
+/// Written as the sum with the powers spelled out, not as Horner: the script is
+/// allowed to rearrange because multiplications are expensive there, and the
+/// reference should say what is meant so a mistake in the rearrangement shows up
+/// as a disagreement. The powers start at `chi^0 = 1`, which is Plonky3's
+/// `shifted_powers` convention and not the `gamma^(i+1)` of the paper's
+/// `sigma'`.
+pub fn constraint_eval_batched(
+    randomness: &[[u32; 4]],
+    groups: &[([u32; 4], Vec<[u32; 4]>, usize)],
+) -> [u32; 4] {
+    use poseidon2::reference::ext4;
+    let mut acc = [0u32; 4];
+    for (chi, scalars, arity) in groups {
+        let local = &randomness[randomness.len() - arity..];
+        let mut power = EF_ONE;
+        for u in scalars {
+            let point = expand_univariate(*u, *arity);
+            acc = ext4::add(acc, ext4::mul(power, eq_eval(&point, local)));
+            power = ext4::mul(power, *chi);
+        }
+    }
+    acc
+}
+
 /// `sum_j w_j * f_M(z_j)`: the mirror of [`crate::constraint::closing_check`].
 ///
 /// Returns the accumulated left-hand side, so a test can compare it with the

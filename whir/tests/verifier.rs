@@ -118,8 +118,8 @@ fn small() -> Config {
     Config {
         initial_folding_factor: 2,
         initial_ood_samples: 1,
-        rounds: vec![Round { folding_factor: 2, num_queries: 3, log_domain_size: 6, ood_samples: 1, row_len: 4 }],
-        final_round: Round { folding_factor: 2, num_queries: 3, log_domain_size: 4, ood_samples: 0, row_len: 4 },
+        rounds: vec![Round { folding_factor: 2, num_queries: 3, log_domain_size: 6, ood_samples: 1, row_len: 4, domain_gen: 7 }],
+        final_round: Round { folding_factor: 2, num_queries: 3, log_domain_size: 4, ood_samples: 0, row_len: 4, domain_gen: 11 },
         final_sumcheck_rounds: 2,
         final_poly_vars: 2,
     }
@@ -188,6 +188,9 @@ struct Spine {
     /// The final polynomial, which `verify` keeps a copy of because the closing
     /// identity evaluates it.
     final_poly: Vec<[u32; 4]>,
+    /// The constraint groups the schedule derives: per group, its batching
+    /// challenge, its scalars in sampling order, and its arity.
+    groups: Vec<([u32; 4], Vec<[u32; 4]>, usize)>,
 }
 
 fn build_spine(cfg: &Config, rng: &mut ChaCha20Rng, state0: [u32; 16], claim0: [u32; 4]) -> Spine {
@@ -226,19 +229,36 @@ fn build_spine(cfg: &Config, rng: &mut ChaCha20Rng, state0: [u32; 16], claim0: [
 
     // The openings for one round: indices sampled from the rate, `RATE` of them
     // per squeeze, then the siblings deepest-last and the row.
-    let queries = |r: &Round, tree: &Tree, items: &mut Vec<u32>, state: &mut [u32; 16]| {
+    // A query opening, and the constraint scalar it produces: the folded domain
+    // generator raised to the sampled index, embedded in the extension.
+    let queries = |r: &Round,
+                   tree: &Tree,
+                   items: &mut Vec<u32>,
+                   state: &mut [u32; 16],
+                   scalars: &mut Vec<[u32; 4]>| {
         for q in 0..r.num_queries {
             let slot = q % reference::RATE;
             if q > 0 && slot == 0 {
                 reference::squeeze(state);
             }
-            let index =
-                reference::sample_bits(state[slot], r.log_domain_size) as usize;
+            let index = reference::sample_bits(state[slot], r.log_domain_size) as usize;
             for sib in tree.siblings(index).iter().rev() {
                 items.extend_from_slice(sib);
             }
             items.extend_from_slice(&tree.rows[index]);
+            let mut g = 1u32;
+            for _ in 0..index {
+                g = poseidon2::reference::mul(g, r.domain_gen);
+            }
+            scalars.push([g, 0, 0, 0]);
         }
+    };
+
+    // A group's batching challenge: a fresh squeeze, then the first four rate
+    // slots, matching what the script emits.
+    let batching = |state: &mut [u32; 16]| -> [u32; 4] {
+        let rate = reference::squeeze(state);
+        [rate[0], rate[1], rate[2], rate[3]]
     };
 
     // Commit phase: the initial root and its out-of-domain samples.
@@ -248,23 +268,40 @@ fn build_spine(cfg: &Config, rng: &mut ChaCha20Rng, state0: [u32; 16], claim0: [
             reference::duplexing(state, block);
         }
     };
-    commit(&trees[0], &mut items, &mut state);
-    for _ in 0..cfg.initial_ood_samples {
-        absorb(4, &mut items, &mut state, rng);
-    }
-    sumcheck(cfg.initial_folding_factor, &mut items, &mut state, &mut claim, rng, &mut randomness);
+    let m = total_folding_vars(cfg);
+    let mut groups: Vec<([u32; 4], Vec<[u32; 4]>, usize)> = Vec::new();
 
-    for (i, r) in cfg.rounds.iter().enumerate() {
-        // Absorb the *next* codeword's root, then open the previous one.
-        commit(&trees[i + 1], &mut items, &mut state);
+    commit(&trees[0], &mut items, &mut state);
+    let mut scalars: Vec<[u32; 4]> = Vec::new();
+    for _ in 0..cfg.initial_ood_samples {
         // The point is sampled from the rate the previous absorb produced, and
         // only then is the answer absorbed. Sampling reads the state without
-        // permuting, so the mirror has nothing to do but keep the order.
+        // permuting, so the mirror only has to keep the order -- and to record
+        // the point, which is now a constraint the closing check will evaluate.
+        scalars.push([state[0], state[1], state[2], state[3]]);
+        absorb(4, &mut items, &mut state, rng);
+    }
+    // The initial commitment has every variable, so its constraint reads all of R.
+    let chi = batching(&mut state);
+    scalars.push(chi);
+    groups.push((chi, scalars[..scalars.len() - 1].to_vec(), m));
+    sumcheck(cfg.initial_folding_factor, &mut items, &mut state, &mut claim, rng, &mut randomness);
+    let mut r_len = cfg.initial_folding_factor;
+
+    for (i, r) in cfg.rounds.iter().enumerate() {
+        let arity = m - r_len;
+        // Absorb the *next* codeword's root, then open the previous one.
+        commit(&trees[i + 1], &mut items, &mut state);
+        let mut scalars: Vec<[u32; 4]> = Vec::new();
         for _ in 0..r.ood_samples {
+            scalars.push([state[0], state[1], state[2], state[3]]);
             absorb(4, &mut items, &mut state, rng);
         }
-        queries(r, &trees[i], &mut items, &mut state);
+        queries(r, &trees[i], &mut items, &mut state, &mut scalars);
+        let chi = batching(&mut state);
+        groups.push((chi, scalars, arity));
         sumcheck(r.folding_factor, &mut items, &mut state, &mut claim, rng, &mut randomness);
+        r_len += r.folding_factor;
     }
     let poly_start = items.len();
     absorb(4 << cfg.final_poly_vars, &mut items, &mut state, rng);
@@ -272,10 +309,19 @@ fn build_spine(cfg: &Config, rng: &mut ChaCha20Rng, state0: [u32; 16], claim0: [
         .chunks(4)
         .map(|c| [c[0], c[1], c[2], c[3]])
         .collect();
-    queries(&cfg.final_round, trees.last().expect("one per round plus one"), &mut items, &mut state);
+    // The final proximity test checks its answers against the final polynomial
+    // directly rather than accumulating a constraint, so its scalars go nowhere.
+    let mut unused = Vec::new();
+    queries(
+        &cfg.final_round,
+        trees.last().expect("one per round plus one"),
+        &mut items,
+        &mut state,
+        &mut unused,
+    );
     sumcheck(cfg.final_sumcheck_rounds, &mut items, &mut state, &mut claim, rng, &mut randomness);
 
-    Spine { items, claim, state, randomness, final_poly }
+    Spine { items, claim, state, randomness, final_poly, groups }
 }
 
 /// The spine executes, and lands where the reference does.
@@ -302,13 +348,26 @@ fn transcript_spine_executes_and_matches_the_reference() {
 
     let m = total_folding_vars(&cfg);
     let f = 4 * (1usize << cfg.final_poly_vars);
-    assert_eq!(got.len(), f + 4 * m + 4 + 16, "unexpected stack shape");
-    assert_eq!(&got[..f], want.final_poly.concat().as_slice(),
+    let carried = 4 * verifier::carried_scalars(&cfg);
+    assert_eq!(got.len(), carried + f + 4 * m + 4 + 16, "unexpected stack shape");
+
+    // The carried constraint scalars, in the order the transcript sampled them:
+    // per group, its scalars and then its batching challenge.
+    let mut want_scalars: Vec<u32> = Vec::new();
+    for (chi, scalars, _) in want.groups.iter() {
+        for u in scalars {
+            want_scalars.extend_from_slice(u);
+        }
+        want_scalars.extend_from_slice(chi);
+    }
+    assert_eq!(&got[..carried], want_scalars.as_slice(),
+               "the carried constraint scalars are wrong, or in the wrong order");
+    assert_eq!(&got[carried..carried + f], want.final_poly.concat().as_slice(),
                "the kept final polynomial is wrong, or in the wrong place");
-    assert_eq!(&got[f..f + 4 * m], want.randomness.concat().as_slice(),
+    assert_eq!(&got[carried + f..carried + f + 4 * m], want.randomness.concat().as_slice(),
                "the folding randomness is not contiguous beneath the claim");
-    assert_eq!(&got[f + 4 * m..f + 4 * m + 4], &want.claim, "claim disagrees with the reference");
-    assert_eq!(&got[f + 4 * m + 4..], &want.state, "sponge state disagrees with the reference");
+    assert_eq!(&got[carried + f + 4 * m..carried + f + 4 * m + 4], &want.claim, "claim disagrees");
+    assert_eq!(&got[carried + f + 4 * m + 4..], &want.state, "sponge state disagrees");
 }
 
 /// Changing one byte of the transcript changes the claim the spine reaches.
@@ -351,7 +410,7 @@ fn transcript_spine_is_sensitive_to_every_absorbed_value() {
             .map(|k| decode(&info.final_stack.get(k)) as u32)
             .collect();
         let m = total_folding_vars(&cfg);
-        let f = 4 * (1usize << cfg.final_poly_vars);
+        let f = 4 * (1usize << cfg.final_poly_vars) + 4 * verifier::carried_scalars(&cfg);
         assert_ne!(
             &got[f + 4 * m..f + 4 * m + 4],
             &want.claim,
@@ -430,6 +489,8 @@ fn report_verifier_arithmetic() {
     let sumcheck_rounds =
         cfg.initial_folding_factor + cfg.rounds.iter().map(|r| r.folding_factor).sum::<usize>()
             + cfg.final_sumcheck_rounds;
+    // One squeeze per constraint group, for its batching challenge.
+    let challenges = 1 + cfg.rounds.len();
     let absorbs: usize = poseidon2::merkle::DIGEST.div_ceil(reference::RATE)
         + cfg.initial_ood_samples
         + cfg
@@ -449,12 +510,13 @@ fn report_verifier_arithmetic() {
                 + r.num_queries * (r.log_domain_size + r.row_len.div_ceil(8))
         })
         .sum();
-    let predicted = sumcheck_rounds + absorbs + queries;
+    let predicted = sumcheck_rounds + absorbs + queries + challenges;
     let emitted = verifier::verify(&cfg).len();
     let arithmetic = emitted - predicted * one;
     println!(
         "\n  verifier: {predicted} permutations = {} B, emitted {emitted} B\n  \
-         ({sumcheck_rounds} sumcheck, {absorbs} absorb, {queries} query)\n  \
+         ({sumcheck_rounds} sumcheck, {absorbs} absorb, {queries} query, \
+{challenges} challenge)\n  \
          arithmetic and bookkeeping: {arithmetic} B ({:.1}% of the whole)\n",
         predicted * one,
         100.0 * arithmetic as f64 / emitted as f64
@@ -477,6 +539,7 @@ fn example() -> Config {
             ood_samples: 2,
             // 2^folding_factor extension elements: the fibre a shift query reads.
             row_len: 4 * (1 << 4),
+            domain_gen: 7,
         });
         log_domain -= 4;
     }
@@ -490,6 +553,7 @@ fn example() -> Config {
             log_domain_size: log_domain,
             ood_samples: 0,
             row_len: 4 * (1 << 4),
+            domain_gen: 11,
         },
         final_sumcheck_rounds: 4,
         final_poly_vars: 4,
@@ -596,10 +660,21 @@ fn build_closing(cfg: &Config, rng: &mut ChaCha20Rng, state0: [u32; 16], claim0:
     let r_fin = &spine.randomness[m - v..];
     let f_at_r = reference::eval_multilinear(&spine.final_poly, r_fin);
 
-    // One constraint over every variable -- the evaluation query the whole
-    // protocol exists to answer. Its point is the statement, not a prover
-    // choice; its weight is solved for so that the instance is a *valid* one,
-    // the same way a prover would produce a proof that verifies.
+    // Everything the transcript produced, evaluated at the randomness it also
+    // produced. Nothing here is supplied.
+    let derived = reference::constraint_eval_batched(&spine.randomness, &spine.groups);
+    // If this were zero the composed test would still pass and would be saying
+    // nothing about the derived half of the weight.
+    assert_ne!(derived, [0u32; 4], "the derived constraints contribute nothing");
+    assert!(
+        spine.groups.iter().map(|(_, s, _)| s.len()).sum::<usize>() >= 4,
+        "too few derived constraints for the test to mean much"
+    );
+
+    // On top of it, one constraint over every variable: the evaluation query
+    // the whole protocol exists to answer. Its point is the statement, not a
+    // prover choice; its weight is solved for so that the instance is a *valid*
+    // one, the same way a prover would produce a proof that verifies.
     let point: Vec<[u32; 4]> = (0..m).map(|_| rand_ef(rng)).collect();
     let e = reference::eq_eval(&point, &spine.randomness);
     let denom = to_ef(e) * to_ef(f_at_r);
@@ -608,12 +683,15 @@ fn build_closing(cfg: &Config, rng: &mut ChaCha20Rng, state0: [u32; 16], claim0:
         <Ef as p3_field::PrimeCharacteristicRing>::ZERO,
         "degenerate instance: eq or the final evaluation vanished"
     );
-    let weight = of_ef(to_ef(spine.claim) * p3_field::Field::inverse(&denom));
+    // claim = (derived + weight*e) * f_at_r  =>  weight = (claim/f_at_r - derived)/e
+    let target = to_ef(spine.claim) * p3_field::Field::inverse(&to_ef(f_at_r));
+    let weight = of_ef((target - to_ef(derived)) * p3_field::Field::inverse(&to_ef(e)));
 
     // The reference agrees the identity holds, independently of any script.
-    let lhs = reference::constraint_eval(&spine.randomness, &[vec![(weight, point.clone())]]);
+    let supplied = reference::constraint_eval(&spine.randomness, &[vec![(weight, point.clone())]]);
+    let total = pf::ext4::add(derived, supplied);
     assert_eq!(
-        of_ef(to_ef(lhs) * to_ef(f_at_r)),
+        of_ef(to_ef(total) * to_ef(f_at_r)),
         spine.claim,
         "the constructed instance does not satisfy w(R) * f_M(r_fin) == claim"
     );
@@ -722,6 +800,7 @@ fn clone_closing(c: &Closing) -> Closing {
             state: c.spine.state,
             randomness: c.spine.randomness.clone(),
             final_poly: c.spine.final_poly.clone(),
+            groups: c.spine.groups.clone(),
         },
         weight: c.weight,
         point: c.point.clone(),
@@ -767,6 +846,7 @@ fn the_closing_inputs_match_the_reference() {
     let v = cfg.final_poly_vars;
     let n_evals = 1usize << v;
     let lift = 4 * n_evals + 4 * m + 4 - 1;
+    let carried = 4 * verifier::carried_scalars(&cfg);
 
     let got = run_ok(script! {
         { constraint_to_altstack(c.weight, &c.point) }
@@ -784,7 +864,8 @@ fn the_closing_inputs_match_the_reference() {
     let f_at_r = reference::eval_multilinear(&c.spine.final_poly, &c.spine.randomness[m - v..]);
     assert_eq!(&got[got.len() - 4..], &f_at_r, "f_M(r_fin) disagrees");
     assert_eq!(&got[got.len() - 8..got.len() - 4], &c.spine.claim, "the claim moved");
-    assert_eq!(&got[..4 * m], c.spine.randomness.concat().as_slice(), "the randomness moved");
+    assert_eq!(&got[carried..carried + 4 * m], c.spine.randomness.concat().as_slice(),
+               "the randomness moved");
 }
 
 /// One query opening, in the position the schedule puts it in.
