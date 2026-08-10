@@ -141,6 +141,89 @@ pub fn round_committed(i: usize, pks_out: &[[u8; 20]], pks_in: &[[u8; 20]]) -> S
     }
 }
 
+/// A run of consecutive rounds, with only its two endpoints committed.
+///
+/// # Why a chunk is not one round
+///
+/// [`round_committed`] commits both sides of a single round, so the commitment
+/// layer is paid once per round: 44 kB of signature against 50 kB of arithmetic,
+/// and one key of 131 chains for every boundary in the schedule. That is the
+/// wrong ratio, and it is not forced — a challenger only has to execute the run
+/// containing the disputed round, so the intermediate states inside a run never
+/// need to be committed at all.
+///
+/// Making the run longer therefore amortises a fixed cost against a growing
+/// one, and the length is decided by what still relays:
+///
+/// ```text
+/// len * round + signatures  <=  MAX_STANDARD_TX_WEIGHT
+/// ```
+///
+/// [`max_chunk_len`] solves that. The saving is in the *setup*, which is what
+/// BitVM2 deployments actually struggle with: committing every round boundary
+/// needs one key per round, and committing every chunk boundary needs one per
+/// chunk.
+///
+/// # Stack
+///
+/// As [`round_committed`], and for the same reasons: the input signature is read
+/// first and parked, which frees the output's witness and returns the state in
+/// the order the rounds want.
+///
+/// # Bounds
+///
+/// `first + len` must stay inside one permutation. The state between
+/// permutations is not a permutation state — the sponge and the Merkle walk sit
+/// in between — so a chunk that spanned two would be claiming a step the
+/// schedule does not take.
+pub fn chunk_committed(
+    first: usize,
+    len: usize,
+    pks_out: &[[u8; 20]],
+    pks_in: &[[u8; 20]],
+) -> Script {
+    let all = permutation::rounds();
+    assert!(
+        len >= 1 && first + len <= all.len(),
+        "a chunk of {len} from {first} leaves the permutation, which has {} rounds",
+        all.len()
+    );
+    let body: Vec<Script> = all.into_iter().skip(first).take(len).collect();
+    script! {
+        { winternitz::verify(pks_in, WIDTH) }
+        for _ in 0..WIDTH { OP_TOALTSTACK }
+        { winternitz::verify(pks_out, WIDTH) }
+        for _ in 0..WIDTH { OP_FROMALTSTACK }
+        for r in body { { r } }
+        { differs(WIDTH) }
+    }
+}
+
+/// The longest chunk that still fits a standard transaction.
+///
+/// Measured rather than divided: the rounds are not all the same size, and the
+/// answer is the longest *run* that fits, not the budget over the mean.
+pub fn max_chunk_len(budget: usize) -> usize {
+    let pks = vec![[0u8; 20]; winternitz::state_chains()];
+    let n = rounds_per_permutation();
+    (1..=n)
+        .take_while(|&len| {
+            (0..=n - len).all(|first| chunk_committed(first, len, &pks, &pks).len() <= budget)
+        })
+        .last()
+        .unwrap_or(0)
+}
+
+/// Bytes of the largest chunk of `len` rounds.
+pub fn largest_chunk(len: usize) -> usize {
+    let pks = vec![[0u8; 20]; winternitz::state_chains()];
+    let n = rounds_per_permutation();
+    (0..=n - len)
+        .map(|first| chunk_committed(first, len, &pks, &pks).len())
+        .max()
+        .unwrap_or(0)
+}
+
 /// Bytes of the largest step, which is what decides whether a chunk relays.
 pub fn largest_round() -> usize {
     (0..rounds_per_permutation()).map(|i| round(i).len()).max().unwrap_or(0)

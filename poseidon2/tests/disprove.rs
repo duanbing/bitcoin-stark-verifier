@@ -240,3 +240,73 @@ fn report_committed_step_size() {
         "two signatures do not fit the stack limit"
     );
 }
+
+/// A chunk of several rounds, committed only at its ends.
+#[test]
+fn a_committed_chunk_is_disprovable_exactly_when_the_prover_lied() {
+    let mut rng = ChaCha20Rng::seed_from_u64(91);
+    let len = disprove::max_chunk_len(400_000);
+    assert!(len >= 2, "a chunk of one round is no better than a step");
+    let first = 1usize;
+
+    let state = rand_state(&mut rng);
+    let honest = run(script! {
+        for x in state { {x} }
+        for r in permutation::rounds().into_iter().skip(first).take(len) { { r } }
+    });
+    assert_eq!(honest.len(), WIDTH);
+
+    let key_in = keygen(&mut rng);
+    let key_out = keygen(&mut rng);
+    let spend = |out: &[u32], out_key: &Key| {
+        script! {
+            { sign(out_key, out) }
+            { sign(&key_in, &state) }
+            { disprove::chunk_committed(first, len, &key_out.pks, &key_in.pks) }
+        }
+    };
+
+    assert_eq!(run(spend(&honest, &key_out)), vec![0], "an honest chunk was disprovable");
+
+    let mut lie = honest.clone();
+    lie[9] = reference::add(lie[9], 1);
+    assert_eq!(run(spend(&lie, &key_out)), vec![1], "a signed lie was not disprovable");
+
+    let other = keygen(&mut rng);
+    assert!(
+        bitcoin_scriptexec::execute_script(spend(&lie, &other)).error.is_some(),
+        "a state signed with the wrong key was accepted"
+    );
+}
+
+/// What chunking buys, which is setup rather than on-chain cost.
+#[test]
+fn report_chunk_length() {
+    const STANDARD_TX_WU: usize = 400_000;
+    let round = disprove::largest_round();
+    let len = disprove::max_chunk_len(STANDARD_TX_WU);
+    let per_perm = disprove::rounds_per_permutation();
+
+    println!("\n  how long a chunk can be");
+    println!("  -----------------------");
+    println!("  len   bytes      of a standard tx   commitments per permutation");
+    for l in [1usize, 2, 4, len, len + 1] {
+        if l == 0 || l > per_perm {
+            continue;
+        }
+        let b = disprove::largest_chunk(l);
+        let fits = if b <= STANDARD_TX_WU { "" } else { "   (does not relay)" };
+        println!(
+            "  {l:>3} {b:>10} B {:>15.1}% {:>25}{fits}",
+            100.0 * b as f64 / STANDARD_TX_WU as f64,
+            per_perm.div_ceil(l),
+        );
+    }
+    println!(
+        "\n  longest chunk that relays: {len} rounds, so {} commitments per\n  \
+         permutation rather than {per_perm} -- a {:.1}x cut in setup.\n",
+        per_perm.div_ceil(len),
+        per_perm as f64 / per_perm.div_ceil(len) as f64,
+    );
+    let _ = round;
+}

@@ -214,7 +214,11 @@ fn chunk_count_for_a_disprove() {
     let bare = poseidon2::disprove::largest_round();
     let step = poseidon2::disprove::largest_committed_round();
     let per_perm = poseidon2::disprove::rounds_per_permutation();
-    let per_tx = STANDARD_TX_WU / step;
+    // A chunk commits only its two endpoints, so its length is decided by what
+    // still relays rather than by paying the commitment once per round.
+    let chunk_len = poseidon2::disprove::max_chunk_len(STANDARD_TX_WU);
+    let chunk = poseidon2::disprove::largest_chunk(chunk_len);
+    let chunks_per_perm = per_perm.div_ceil(chunk_len);
 
     println!("\n  disprove chunking, one step = one Poseidon2 round");
     println!("  ------------------------------------------------");
@@ -223,7 +227,9 @@ fn chunk_count_for_a_disprove() {
              100.0 * step as f64 / STANDARD_TX_WU as f64);
     println!("  of which the signatures    {:>12} B  ({:.0}%)",
              step - bare, 100.0 * (step - bare) as f64 / step as f64);
-    println!("  steps per standard tx      {per_tx:>12}");
+    println!("  a chunk of {chunk_len} rounds      {chunk:>12} B  ({:.1}% of a standard tx)",
+             100.0 * chunk as f64 / STANDARD_TX_WU as f64);
+    println!("  chunks per permutation     {chunks_per_perm:>12}  (rather than {per_perm})");
     println!();
     println!("  security  pow   vars   permutations         steps        chunks   disprove");
     println!("  --------------------------------------------------------------------------");
@@ -235,17 +241,18 @@ fn chunk_count_for_a_disprove() {
             };
             let perms = whir::verifier::permutation_count(&cfg);
             let steps = perms * per_perm;
-            let chunks = steps.div_ceil(per_tx);
+            let chunks = perms * chunks_per_perm;
             println!(
                 "  {security:>3} {:>6} {vars:>6} {perms:>14} {steps:>13} {chunks:>13} {:>10} B",
-                22, step,
+                22, chunk,
             );
         }
     }
     println!("\n  A disprove spends one chunk. Everything else stays off-chain unless");
     println!("  someone cheats, which is the whole of the trick.\n");
 
-    assert!(step < STANDARD_TX_WU, "a step does not relay");
+    assert!(step < STANDARD_TX_WU, "a committed step does not relay");
+    assert!(chunk <= STANDARD_TX_WU, "the chosen chunk length does not relay");
 }
 
 /// What the chunking does *not* cover, stated rather than implied.
