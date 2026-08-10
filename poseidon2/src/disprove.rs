@@ -39,7 +39,7 @@
 //! say a check of an assertion nobody made.
 
 use crate::constants::WIDTH;
-use crate::permutation;
+use crate::{permutation, winternitz};
 use crate::treepp::*;
 
 /// One iff the two `n`-element vectors differ somewhere.
@@ -106,7 +106,51 @@ pub fn round(i: usize) -> Script {
     }
 }
 
+/// The complete disprove: round `i`, with both states taken from signatures.
+///
+/// # Stack
+///
+/// Witness, in pop order: the signature over the input, then the signature over
+/// the claimed output — [`crate::winternitz::verify`]'s layout twice.
+/// Out: `1` if the claimed output is wrong, `0` if it is right.
+///
+/// # Why the input is verified first, and parked
+///
+/// Each verification consumes its witness from the top and leaves its state
+/// there, so the second signature has to still be reachable — which it is not
+/// if the first verification's output is sitting on top of it. The input is
+/// therefore read first and moved to the altstack, which both frees the output's
+/// witness and, because the move reverses twice, brings the state back in its
+/// original order. That is also the order [`round`] wants: `claimed_out`
+/// beneath `state_in`.
+///
+/// # What this costs, and what it buys
+///
+/// Two signature verifications on top of the round: at `w = 16` a state is 131
+/// chains, so the pair is 262 witness items and about 44 kB of script against
+/// the round's 50 kB. That is the price of the step being *the prover's* rather
+/// than merely well-formed, and it is the difference between a disprove and a
+/// check of an assertion nobody made.
+pub fn round_committed(i: usize, pks_out: &[[u8; 20]], pks_in: &[[u8; 20]]) -> Script {
+    script! {
+        { winternitz::verify(pks_in, WIDTH) }
+        for _ in 0..WIDTH { OP_TOALTSTACK }
+        { winternitz::verify(pks_out, WIDTH) }
+        for _ in 0..WIDTH { OP_FROMALTSTACK }
+        { round(i) }
+    }
+}
+
 /// Bytes of the largest step, which is what decides whether a chunk relays.
 pub fn largest_round() -> usize {
     (0..rounds_per_permutation()).map(|i| round(i).len()).max().unwrap_or(0)
+}
+
+/// Bytes of the largest *committed* step — the number a chunk is measured by.
+pub fn largest_committed_round() -> usize {
+    let pks = vec![[0u8; 20]; winternitz::state_chains()];
+    (0..rounds_per_permutation())
+        .map(|i| round_committed(i, &pks, &pks).len())
+        .max()
+        .unwrap_or(0)
 }

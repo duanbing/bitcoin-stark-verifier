@@ -204,16 +204,25 @@ fn whole_verifier_against_a_block() {
 /// 572 252 bytes against 400 000 weight units. The rounds are what
 /// `permutation::rounds()` emits and what `rounds_compose_to_the_permutation`
 /// pins to `permute()`.
+///
+/// The step measured here is the *committed* one — both its states taken from
+/// Winternitz signatures rather than from the witness. An uncommitted step is
+/// smaller and is not a disprove: a spender would pick whichever pair of states
+/// makes the predicate fire.
 #[test]
 fn chunk_count_for_a_disprove() {
-    let step = poseidon2::disprove::largest_round();
+    let bare = poseidon2::disprove::largest_round();
+    let step = poseidon2::disprove::largest_committed_round();
     let per_perm = poseidon2::disprove::rounds_per_permutation();
     let per_tx = STANDARD_TX_WU / step;
 
     println!("\n  disprove chunking, one step = one Poseidon2 round");
     println!("  ------------------------------------------------");
-    println!("  largest step               {step:>12} B  ({:.1}% of a standard tx)",
+    println!("  the round alone            {bare:>12} B");
+    println!("  a committed step           {step:>12} B  ({:.1}% of a standard tx)",
              100.0 * step as f64 / STANDARD_TX_WU as f64);
+    println!("  of which the signatures    {:>12} B  ({:.0}%)",
+             step - bare, 100.0 * (step - bare) as f64 / step as f64);
     println!("  steps per standard tx      {per_tx:>12}");
     println!();
     println!("  security  pow   vars   permutations         steps        chunks   disprove");

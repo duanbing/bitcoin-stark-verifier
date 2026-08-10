@@ -36,6 +36,7 @@ pub mod field;
 pub mod merkle;
 pub mod permutation;
 pub mod reference;
+pub mod winternitz;
 
 pub(crate) mod treepp {
     pub use bitcoin_script::{define_pushable, script};

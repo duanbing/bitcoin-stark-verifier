@@ -132,3 +132,111 @@ fn report_step_size() {
          the chunking has to go finer than one permutation round"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The complete disprove: states taken from signatures, not from the witness
+// ---------------------------------------------------------------------------
+
+use bitcoin::hashes::{hash160, Hash};
+use poseidon2::winternitz::{self, DIGITS_PER_ELEMENT, W};
+
+fn h160(x: &[u8; 20]) -> [u8; 20] {
+    hash160::Hash::hash(x).to_byte_array()
+}
+
+struct Key {
+    secrets: Vec<[u8; 20]>,
+    pks: Vec<[u8; 20]>,
+}
+
+fn keygen(rng: &mut ChaCha20Rng) -> Key {
+    let n = winternitz::state_chains();
+    let secrets: Vec<[u8; 20]> = (0..n).map(|_| rng.random::<[u8; 20]>()).collect();
+    let pks = secrets.iter().map(|sk| (0..W - 1).fold(*sk, |a, _| h160(&a))).collect();
+    Key { secrets, pks }
+}
+
+fn sign(key: &Key, state: &[u32]) -> bitcoin::ScriptBuf {
+    let mut ds: Vec<u32> = Vec::new();
+    for &x in state {
+        ds.extend_from_slice(&winternitz::digits_of(x));
+    }
+    let sum: u32 = ds.iter().sum();
+    let check = (ds.len() * (W - 1)) as u32 - sum;
+    for j in 0..winternitz::checksum_digits(ds.len()) {
+        ds.push((check >> (winternitz::LOG_W * j)) & (W as u32 - 1));
+    }
+    let sigs: Vec<(Vec<u8>, u32)> = ds
+        .iter()
+        .enumerate()
+        .map(|(i, &d)| ((0..d).fold(key.secrets[i], |a, _| h160(&a)).to_vec(), d))
+        .collect();
+    script! { for (s, d) in sigs.into_iter().rev() { { s } { d } } }
+}
+
+/// The complete predicate: honest is not disprovable, wrong is, unsigned aborts.
+///
+/// The third case is the one the commitment layer exists for. Without it a
+/// spender picks whatever pair of states makes the predicate fire.
+#[test]
+fn a_committed_round_is_disprovable_exactly_when_the_prover_lied() {
+    let mut rng = ChaCha20Rng::seed_from_u64(90);
+    let i = disprove::rounds_per_permutation() / 2;
+    let state = rand_state(&mut rng);
+    let honest = run(script! {
+        for x in state { {x} }
+        { permutation::rounds().into_iter().nth(i).expect("round") }
+    });
+
+    let key_in = keygen(&mut rng);
+    let key_out = keygen(&mut rng);
+
+    let spend = |out: &[u32], sig_out_key: &Key| {
+        script! {
+            { sign(sig_out_key, out) }
+            { sign(&key_in, &state) }
+            { disprove::round_committed(i, &key_out.pks, &key_in.pks) }
+        }
+    };
+
+    // The prover signed the honest output: nothing to disprove.
+    let got = run(spend(&honest, &key_out));
+    assert_eq!(got, vec![0], "an honest committed step was disprovable");
+
+    // The prover signed a wrong output: the bond is claimable.
+    let mut lie = honest.clone();
+    lie[3] = reference::add(lie[3], 1);
+    let got = run(spend(&lie, &key_out));
+    assert_eq!(got, vec![1], "a signed lie was not disprovable");
+
+    // A state nobody signed: the spend does not even run to a verdict.
+    let other = keygen(&mut rng);
+    let info = bitcoin_scriptexec::execute_script(spend(&lie, &other));
+    assert!(
+        info.error.is_some(),
+        "a state signed with the wrong key was accepted -- the predicate is unbound"
+    );
+}
+
+/// What a committed step costs, which is what a chunk is measured by.
+#[test]
+fn report_committed_step_size() {
+    const STANDARD_TX_WU: usize = 400_000;
+    let bare = disprove::largest_round();
+    let committed = disprove::largest_committed_round();
+    println!("\n  a step, bare and committed");
+    println!("  --------------------------");
+    println!("  round alone                  {bare:>10} B");
+    println!("  with both states signed      {committed:>10} B");
+    println!("  the commitment layer         {:>10} B  ({:.0}% of the step)",
+             committed - bare, 100.0 * (committed - bare) as f64 / committed as f64);
+    println!("  as a share of a standard tx  {:>9.1}%", 100.0 * committed as f64 / STANDARD_TX_WU as f64);
+    println!("  committed steps per tx       {:>10}", STANDARD_TX_WU / committed);
+    println!("  witness items                {:>10}  (limit 1000)", 4 * winternitz::state_chains());
+    println!();
+    assert!(committed < STANDARD_TX_WU, "a committed step does not relay");
+    assert!(
+        4 * winternitz::state_chains() < 1000,
+        "two signatures do not fit the stack limit"
+    );
+}
