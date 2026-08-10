@@ -37,6 +37,16 @@ fn derive(
     security_level: usize,
     pow_bits: usize,
 ) -> Result<(Config, Vec<usize>), String> {
+    derive_under(num_variables, security_level, pow_bits, SecurityAssumption::CapacityBound)
+}
+
+/// The same, under a named soundness assumption.
+fn derive_under(
+    num_variables: usize,
+    security_level: usize,
+    pow_bits: usize,
+    soundness_type: SecurityAssumption,
+) -> Result<(Config, Vec<usize>), String> {
     let folding_factor = FoldingFactor::Constant(4);
     // One rate per round, and the recurrence is WHIR's: folding k variables
     // multiplies the rate by 2^(1-k), so log(1/rate) grows by k-1. Writing it
@@ -55,7 +65,7 @@ fn derive(
         pow_bits,
         round_log_inv_rates: rates,
         folding_factor,
-        soundness_type: SecurityAssumption::CapacityBound,
+        soundness_type,
         starting_log_inv_rate: 4,
     };
     // `pow_bits: 0` is not always satisfiable: WHIR trades query count against
@@ -250,4 +260,59 @@ fn report_unchunked_arithmetic() {
          arithmetic is about {arithmetic} B and decomposes into none.\n",
         perms * poseidon2::disprove::rounds_per_permutation()
     );
+}
+
+/// What the soundness regime costs, since the script does not know about it.
+///
+/// Nothing in `whir/src` or `poseidon2/src` mentions a soundness assumption.
+/// The script executes a schedule; which regime produced that schedule is a
+/// parameter of the *configuration*, and it reaches the script only as a query
+/// count. So switching regimes is a config change, and this is what it costs.
+///
+/// The default everywhere in this crate is `CapacityBound`, the cheapest of the
+/// three and the only one resting on the unproven half of WHIR's Conjecture
+/// 4.12. That is the papers' own benchmarking default and a defensible choice,
+/// but a verifier that settles bitcoin should be able to say what the proved
+/// alternative would cost rather than only that it is dearer.
+#[test]
+fn what_the_soundness_regime_costs() {
+    let one = perm_bytes();
+    let regimes = [
+        ("UD, proved       ", SecurityAssumption::UniqueDecoding),
+        ("JB, Conj. 4.12(1)", SecurityAssumption::JohnsonBound),
+        ("CB, Conj. 4.12(2)", SecurityAssumption::CapacityBound),
+    ];
+    println!("\n  soundness regime at 100-bit security");
+    println!("  -----------------------------------");
+    println!("  Each regime is given the grinding it needs rather than a shared");
+    println!("  budget: a weaker assumption wants more of both, and holding pow");
+    println!("  fixed would report 'not derivable' instead of a price.\n");
+    println!("  regime               vars   pow   queries(r0)   permutations        bytes   vs CB");
+    for &vars in [16usize, 20].iter() {
+        let mut baseline = None;
+        for (name, regime) in regimes.iter() {
+            // The smallest grinding budget the regime is derivable at.
+            let found = (0..64).find_map(|pow| {
+                derive_under(vars, 100, pow, *regime).ok().map(|v| (pow, v))
+            });
+            match found {
+                Some((pow, (cfg, queries))) => {
+                    let n = whir::verifier::permutation_count(&cfg);
+                    if matches!(regime, SecurityAssumption::CapacityBound) {
+                        baseline = Some(n);
+                    }
+                    println!(
+                        "  {name}  {vars:>5} {pow:>5} {:>13} {n:>14} {:>12} {}",
+                        queries[0],
+                        n * one,
+                        baseline.map_or(String::new(), |b| format!("{:>6.2}x", n as f64 / b as f64)),
+                    );
+                }
+                None => println!("  {name}  {vars:>5}   not derivable at any grinding budget"),
+            }
+        }
+        println!();
+    }
+    println!("  The script is identical in all three. Only the query count moves,");
+    println!("  and script weight moves with it.\n");
 }
